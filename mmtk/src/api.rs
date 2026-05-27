@@ -114,6 +114,13 @@ pub extern "C" fn mmtk_gc_init(
     // Make sure we initialize MMTk here
     lazy_static::initialize(&SINGLETON);
 
+    // Initialize GC timing infrastructure.  The LXR fork's Timer uses
+    // Option<Instant> which panics on unwrap if not initialized.
+    // ScheduleCollection sets these, but report_gc_start may read them
+    // first during a user-triggered GC.gc().
+    mmtk::GC_TRIGGER_TIME.start();
+    mmtk::GC_START_TIME.start();
+
     // Hijack the panic hook to make sure that if we crash in the GC threads, the process aborts.
     crate::set_panic_hook();
 

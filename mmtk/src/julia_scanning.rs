@@ -638,6 +638,16 @@ pub unsafe fn mmtk_jl_bt_entry_jlvalue(
     unsafe { ObjectReference::from_raw_address_unchecked(Address::from_mut_ptr(entry)) }
 }
 
+/// Returns the slot address of the i-th jlvalue in a backtrace entry.
+/// Unlike mmtk_jl_bt_entry_jlvalue (which dereferences the slot to get the object),
+/// this returns the address of the slot itself, for slot-based root reporting.
+pub unsafe fn mmtk_jl_bt_entry_jlvalue_slot(
+    bt_entry: *mut jl_bt_element_t,
+    i: usize,
+) -> Address {
+    Address::from_ptr(std::ptr::addr_of!((*bt_entry.add(2 + i)).__bindgen_anon_1.jlvalue))
+}
+
 // ====== LXR object classification for concurrent marking ======
 
 use mmtk::vm::ObjectKind;

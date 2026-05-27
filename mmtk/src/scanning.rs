@@ -11,6 +11,7 @@ use mmtk::vm::Scanning;
 use mmtk::vm::ObjectKind;
 use mmtk::vm::SlotVisitor;
 use mmtk::vm::VMBinding;
+use mmtk::vm::slot::SimpleSlot;
 use mmtk::Mutator;
 use mmtk::MMTK;
 
@@ -21,131 +22,196 @@ use crate::JuliaVM;
 
 pub struct VMScanning {}
 
+/// Collects JuliaVMSlot entries from the gcstack scanner.
+/// Unlike the old SlotBuffer (which extracted ObjectReferences from slots),
+/// this preserves the actual slot addresses so LXR can process them
+/// through its slot-based RC increment path (ProcessIncs).
+struct GCStackSlotBuffer {
+    pub buffer: Vec<JuliaVMSlot>,
+}
+
+impl mmtk::vm::SlotVisitor<JuliaVMSlot> for GCStackSlotBuffer {
+    fn visit_slot(&mut self, slot: JuliaVMSlot, _out_of_heap: bool) {
+        // Only include slots that actually point to something
+        if slot.load().is_some() {
+            self.buffer.push(slot);
+        }
+    }
+}
+
+/// Scan a single ptls struct, collecting root slots (not objects) into the buffers.
+///
+/// Root slots are the C-heap field addresses (e.g., &ptls->root_task) — these are
+/// reported as JuliaVMSlot::Simple so LXR's RC increment path can process them.
+/// GC stack slots are collected via GCStackSlotBuffer which preserves slot addresses.
+unsafe fn scan_ptls_roots(
+    ptls: &mut crate::julia_types::_jl_tls_states_t,
+    root_slots: &mut Vec<JuliaVMSlot>,
+    gcstack_slots: &mut GCStackSlotBuffer,
+) {
+    use crate::julia_scanning::*;
+    use crate::julia_types::*;
+    use mmtk::util::Address;
+
+    /// Helper: scan a task's gcstack and optionally add the task's slot as a root.
+    /// `slot_addr` is the address of the C-heap field holding the task pointer.
+    unsafe fn scan_task_at_slot(
+        slot_addr: Address,
+        task: *const _jl_task_t,
+        task_is_root: bool,
+        gcstack_slots: &mut GCStackSlotBuffer,
+        root_slots: &mut Vec<JuliaVMSlot>,
+    ) {
+        if !task.is_null() {
+            // Scan the task's gcstack — produces actual slot addresses
+            mmtk_scan_gcstack(task, gcstack_slots);
+
+            if task_is_root {
+                // Report the C-heap slot holding the task pointer
+                // (e.g., &ptls->root_task) so LXR can RC-increment the task object
+                root_slots.push(JuliaVMSlot::Simple(SimpleSlot::from_address(slot_addr)));
+            }
+        }
+    }
+
+    // Root task  (*mut _jl_task_t)
+    scan_task_at_slot(
+        Address::from_ptr(std::ptr::addr_of!(ptls.root_task)),
+        ptls.root_task as *const _jl_task_t,
+        true,
+        gcstack_slots,
+        root_slots,
+    );
+
+    // Live tasks (not roots themselves — only scan their gcstacks)
+    let mut i = 0;
+    while i < ptls.gc_tls_common.heap.live_tasks.len {
+        let mut task_address = Address::from_ptr(ptls.gc_tls_common.heap.live_tasks.items);
+        task_address = task_address.shift::<Address>(i as isize);
+        let task = task_address.load::<*const jl_task_t>();
+        if !task.is_null() {
+            mmtk_scan_gcstack(task, gcstack_slots);
+        }
+        i += 1;
+    }
+
+    // Current task  (u64 — raw address stored as integer)
+    {
+        let current_task = ptls.current_task as *const _jl_task_t;
+        scan_task_at_slot(
+            Address::from_ptr(std::ptr::addr_of!(ptls.current_task)),
+            current_task,
+            true,
+            gcstack_slots,
+            root_slots,
+        );
+    }
+
+    // Next task  (*mut _jl_task_t)
+    scan_task_at_slot(
+        Address::from_ptr(std::ptr::addr_of!(ptls.next_task)),
+        ptls.next_task as *const _jl_task_t,
+        true,
+        gcstack_slots,
+        root_slots,
+    );
+
+    // Previous task  (*mut _jl_task_t)
+    scan_task_at_slot(
+        Address::from_ptr(std::ptr::addr_of!(ptls.previous_task)),
+        ptls.previous_task as *const _jl_task_t,
+        true,
+        gcstack_slots,
+        root_slots,
+    );
+
+    // Previous exception  (*mut jl_value_t)
+    if !ptls.previous_exception.is_null() {
+        let slot_addr = Address::from_ptr(std::ptr::addr_of!(ptls.previous_exception));
+        root_slots.push(JuliaVMSlot::Simple(SimpleSlot::from_address(slot_addr)));
+    }
+
+    // Backtrace buffer jlvalues — these are slot addresses in the bt_data array
+    let mut i = 0;
+    while i < ptls.bt_size {
+        let bt_entry = ptls.bt_data.add(i);
+        let bt_entry_size = mmtk_jl_bt_entry_size(bt_entry);
+        if mmtk_jl_bt_is_native(bt_entry) {
+            i += bt_entry_size;
+            continue;
+        }
+        let njlvals = mmtk_jl_bt_num_jlvals(bt_entry);
+        for j in 0..njlvals {
+            // Get the address of the bt entry slot itself
+            let bt_slot_addr = mmtk_jl_bt_entry_jlvalue_slot(bt_entry, j);
+            root_slots.push(JuliaVMSlot::Simple(SimpleSlot::from_address(bt_slot_addr)));
+        }
+        i += bt_entry_size;
+    }
+}
+
 impl Scanning<JuliaVM> for VMScanning {
     fn scan_roots_in_mutator_thread(
         _tls: VMWorkerThread,
         mutator: &'static mut Mutator<JuliaVM>,
         mut factory: impl RootsWorkFactory<JuliaVMSlot>,
     ) {
-        // This allows us to reuse mmtk_scan_gcstack which expectes an SlotVisitor
-        // Push the nodes as they need to be transitively pinned
-        struct SlotBuffer {
-            pub buffer: Vec<ObjectReference>,
-        }
-        impl mmtk::vm::SlotVisitor<JuliaVMSlot> for SlotBuffer {
-            fn visit_slot(&mut self, slot: JuliaVMSlot, _out_of_heap: bool) {
-                match slot {
-                    JuliaVMSlot::Simple(se) => {
-                        if let Some(object) = se.load() {
-                            self.buffer.push(object);
-                        }
-                    }
-                    JuliaVMSlot::Offset(oe) => {
-                        if let Some(object) = oe.load() {
-                            self.buffer.push(object);
-                        }
-                    }
-                }
-            }
+        let ptls: &mut crate::julia_types::_jl_tls_states_t =
+            unsafe { std::mem::transmute(mutator.mutator_tls) };
+
+        let mut gcstack_slots = GCStackSlotBuffer { buffer: vec![] };
+        let mut root_slots: Vec<JuliaVMSlot> = vec![];
+
+        unsafe {
+            scan_ptls_roots(ptls, &mut root_slots, &mut gcstack_slots);
         }
 
-        use crate::julia_scanning::*;
-        use crate::julia_types::*;
-        use mmtk::util::Address;
-
-        let ptls: &mut _jl_tls_states_t = unsafe { std::mem::transmute(mutator.mutator_tls) };
-        let mut slot_buffer = SlotBuffer { buffer: vec![] }; // need to be tpinned as they're all from the shadow stack
-        let mut node_buffer = vec![];
-
-        // Scan thread local from ptls: See gc_queue_thread_local in gc.c
-        let mut root_scan_task = |task: *const _jl_task_t, task_is_root: bool| {
-            if !task.is_null() {
-                unsafe {
-                    crate::julia_scanning::mmtk_scan_gcstack(task, &mut slot_buffer);
-                }
-                if task_is_root {
-                    // captures wrong root nodes before creating the work
-                    debug_assert!(
-                        Address::from_ptr(task).is_aligned_to(16)
-                            || Address::from_ptr(task).is_aligned_to(8),
-                        "root node {:?} is not aligned to 8 or 16",
-                        Address::from_ptr(task)
-                    );
-
-                    // unsafe: We checked `!task.is_null()` before.
-                    let objref = unsafe {
-                        ObjectReference::from_raw_address_unchecked(Address::from_ptr(task))
-                    };
-                    node_buffer.push(objref);
-                }
-            }
-        };
-        root_scan_task(ptls.root_task, true);
-
-        // need to iterate over live tasks as well to process their shadow stacks
-        // we should not set the task themselves as roots as we will know which ones are still alive after GC
-        let mut i = 0;
-        while i < ptls.gc_tls_common.heap.live_tasks.len {
-            let mut task_address = Address::from_ptr(ptls.gc_tls_common.heap.live_tasks.items);
-            task_address = task_address.shift::<Address>(i as isize);
-            let task = unsafe { task_address.load::<*const jl_task_t>() };
-            root_scan_task(task, false);
-            i += 1;
-        }
-
-        root_scan_task(ptls.current_task as *mut _jl_task_t, true);
-        root_scan_task(ptls.next_task, true);
-        root_scan_task(ptls.previous_task, true);
-        if !ptls.previous_exception.is_null() {
-            node_buffer.push(unsafe {
-                // unsafe: We have just checked `ptls.previous_exception` is not null.
-                ObjectReference::from_raw_address_unchecked(Address::from_mut_ptr(
-                    ptls.previous_exception,
-                ))
-            });
-        }
-
-        // Scan backtrace buffer: See gc_queue_bt_buf in gc.c
-        let mut i = 0;
-        while i < ptls.bt_size {
-            unsafe {
-                let bt_entry = ptls.bt_data.add(i);
-                let bt_entry_size = mmtk_jl_bt_entry_size(bt_entry);
-                if mmtk_jl_bt_is_native(bt_entry) {
-                    i += bt_entry_size;
-                    continue;
-                }
-                let njlvals = mmtk_jl_bt_num_jlvals(bt_entry);
-                for j in 0..njlvals {
-                    let bt_entry_value = mmtk_jl_bt_entry_jlvalue(bt_entry, j);
-
-                    // captures wrong root nodes before creating the work
-                    debug_assert!(
-                        bt_entry_value.to_raw_address().is_aligned_to(16)
-                            || bt_entry_value.to_raw_address().is_aligned_to(8),
-                        "root node {:?} is not aligned to 8 or 16",
-                        bt_entry_value
-                    );
-
-                    node_buffer.push(bt_entry_value);
-                }
-                i += bt_entry_size;
-            }
-        }
-
-        // We do not need gc_queue_remset from gc.c (we are not using remset in the thread)
-
-        // Push work
+        // Report all roots as slot-based work.
+        // LXR processes slots through RCImmixCollectRootEdges -> ProcessIncs (RC increment path).
+        // ProcessIncs guards non-Immix/LOS objects, so sysimage/immortal objects are safe.
         const CAPACITY_PER_PACKET: usize = 4096;
-        for tpinning_roots in slot_buffer
+
+        // Combine gcstack slots and root slots into a single stream
+        // (they all go through the same RC increment path)
+        let all_slots: Vec<JuliaVMSlot> = gcstack_slots
             .buffer
-            .chunks(CAPACITY_PER_PACKET)
-            .map(|c| c.to_vec())
-        {
-            factory.create_process_tpinning_roots_work(tpinning_roots);
+            .into_iter()
+            .chain(root_slots.into_iter())
+            .collect();
+
+        for chunk in all_slots.chunks(CAPACITY_PER_PACKET).map(|c| c.to_vec()) {
+            factory.create_process_roots_work(chunk, mmtk::scheduler::RootKind::Strong);
         }
-        for nodes in node_buffer.chunks(CAPACITY_PER_PACKET).map(|c| c.to_vec()) {
-            factory.create_process_pinning_roots_work(nodes);
+    }
+
+    fn scan_multiple_thread_root(
+        _tls: VMWorkerThread,
+        mutators: Vec<VMMutatorThread>,
+        mut factory: impl RootsWorkFactory<JuliaVMSlot>,
+    ) {
+        let mut gcstack_slots = GCStackSlotBuffer { buffer: vec![] };
+        let mut root_slots: Vec<JuliaVMSlot> = vec![];
+
+        for mutator_tls in mutators {
+            let ptls: &mut crate::julia_types::_jl_tls_states_t =
+                unsafe { std::mem::transmute(mutator_tls) };
+
+            unsafe {
+                scan_ptls_roots(ptls, &mut root_slots, &mut gcstack_slots);
+            }
+        }
+
+        const CAPACITY_PER_PACKET: usize = 4096;
+
+
+        let all_slots: Vec<JuliaVMSlot> = gcstack_slots
+            .buffer
+            .into_iter()
+            .chain(root_slots.into_iter())
+            .collect();
+
+        for chunk in all_slots.chunks(CAPACITY_PER_PACKET).map(|c| c.to_vec()) {
+            factory.create_process_roots_work(chunk, mmtk::scheduler::RootKind::Strong);
         }
     }
 
