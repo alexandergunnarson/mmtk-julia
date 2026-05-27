@@ -171,17 +171,20 @@ impl Scanning<JuliaVM> for VMScanning {
         _tls: VMWorkerThread,
         object: ObjectReference,
         slot_visitor: &mut impl SlotVisitor<JuliaVMSlot>,
-        _klass: mmtk::util::Address,
+        klass: mmtk::util::Address,
     ) {
-        process_object(object, slot_visitor);
+        // Use the pre-loaded type pointer (klass) to avoid re-reading the header
+        let addr = object.to_raw_address();
+        unsafe {
+            crate::julia_scanning::scan_julia_object_with_type(addr, slot_visitor, klass);
+        }
     }
-    fn get_obj_kind(_o: ObjectReference) -> ObjectKind {
-        // Julia objects are treated as scalars for LXR concurrent marking.
-        // This means large arrays of references won't get the chunked scanning
-        // optimization. This is correct but suboptimal for very large GenericMemory
-        // arrays of boxed references. A future optimization would classify
-        // jl_genericmemory_t objects with pointer elements as ObjArray.
-        ObjectKind::Scalar
+    fn get_obj_kind(object: ObjectReference) -> ObjectKind {
+        unsafe { crate::julia_scanning::get_julia_obj_kind(object) }
+    }
+
+    fn obj_array_data(object: ObjectReference) -> crate::slots::JuliaMemorySlice {
+        unsafe { crate::julia_scanning::get_julia_obj_array_data(object) }
     }
 
     fn notify_initial_thread_scan_complete(_partial_scan: bool, _tls: VMWorkerThread) {

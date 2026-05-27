@@ -637,3 +637,157 @@ pub unsafe fn mmtk_jl_bt_entry_jlvalue(
     debug_assert!(!entry.is_null());
     unsafe { ObjectReference::from_raw_address_unchecked(Address::from_mut_ptr(entry)) }
 }
+
+// ====== LXR object classification for concurrent marking ======
+
+use mmtk::vm::ObjectKind;
+
+/// Classify a Julia object for LXR concurrent marking's chunked scanning optimization.
+/// - GenericMemory with boxed (pointer) elements → ObjArray(len)
+/// - Everything else → Scalar
+pub unsafe fn get_julia_obj_kind(object: ObjectReference) -> ObjectKind {
+    let obj = object.to_raw_address();
+    let vt = mmtk_jl_typeof(obj);
+    if vt.is_null() {
+        return ObjectKind::Scalar;
+    }
+    if (*vt).name == jl_genericmemory_typename {
+        let m = obj.to_ptr::<jl_genericmemory_t>();
+        let layout = (*vt).layout;
+        // Boxed elements = array of pointers → ObjArray
+        if (*layout).flags.arrayelem_isboxed() != 0 && (*m).length > 0 {
+            return ObjectKind::ObjArray((*m).length as u32);
+        }
+    }
+    ObjectKind::Scalar
+}
+
+/// Return a JuliaMemorySlice over the pointer data region of a GenericMemory ObjArray.
+/// Only called when get_obj_kind returned ObjArray.
+pub unsafe fn get_julia_obj_array_data(object: ObjectReference) -> crate::slots::JuliaMemorySlice {
+    let obj = object.to_raw_address();
+    let m = obj.to_ptr::<jl_genericmemory_t>();
+    let length = (*m).length;
+    let data_start = Address::from_ptr((*m).ptr);
+    crate::slots::JuliaMemorySlice {
+        owner: object,
+        start: data_start,
+        count: length,
+    }
+}
+
+// ====== scan_julia_object_with_type: pre-loaded type pointer ======
+
+/// Scan a Julia object using a pre-loaded type pointer (klass), avoiding the
+/// header read that `scan_julia_object` does via `mmtk_jl_typetagof`.
+/// Used by LXR's concurrent marking which caches the class pointer for
+/// chunked large-array scanning.
+pub unsafe fn scan_julia_object_with_type<SV: SlotVisitor<JuliaVMSlot>>(
+    obj: Address,
+    closure: &mut SV,
+    klass: Address,
+) {
+    // If klass is zero (shouldn't happen but be defensive), fall back to the header read
+    if klass.is_zero() {
+        scan_julia_object(obj, closure);
+        return;
+    }
+
+    // The klass is a jl_datatype_t* (what mmtk_jl_typeof returns).
+    // We need to reconstruct the vtag (type tag) that scan_julia_object uses.
+    // mmtk_jl_typeof returns the resolved datatype; the vtag is what's stored in
+    // the header, which may be a smalltag or a direct pointer.
+    //
+    // For the hot path (genericmemory ObjArray), the klass IS the resolved type,
+    // and we can use it directly. For all other cases, the savings from avoiding
+    // one header read are minimal — just fall back to the full scanner.
+    let vt = klass.to_ptr::<jl_datatype_t>();
+
+    // Fast path: if this is a genericmemory, we can scan it directly with the known type
+    if (*vt).name == jl_genericmemory_typename {
+        scan_genericmemory_with_type(obj, closure, vt);
+        return;
+    }
+
+    // For all other object kinds, fall back to the full scanner.
+    // The cost of one extra header read is negligible for non-array objects.
+    scan_julia_object(obj, closure);
+}
+
+/// Scan a GenericMemory object with a known type pointer.
+/// This is the hot path optimization — large GenericMemory arrays of pointers
+/// are the main beneficiary of the klass caching in LXR's concurrent marking.
+unsafe fn scan_genericmemory_with_type<SV: SlotVisitor<JuliaVMSlot>>(
+    obj: Address,
+    closure: &mut SV,
+    vt: *const jl_datatype_t,
+) {
+    let m = obj.to_ptr::<jl_genericmemory_t>();
+    let how = jl_gc_genericmemory_how(obj);
+
+    if how == 3 {
+        let owner_addr = mmtk_jl_genericmemory_data_owner_field_address(m);
+        process_slot(closure, owner_addr);
+        return;
+    }
+
+    if (*m).length == 0 {
+        return;
+    }
+
+    let layout = (*vt).layout;
+    if (*layout).flags.arrayelem_isboxed() != 0 {
+        let length = (*m).length;
+        let mut objary_begin = Address::from_ptr((*m).ptr);
+        let objary_end = objary_begin.shift::<Address>(length as isize);
+        while objary_begin < objary_end {
+            process_slot(closure, objary_begin);
+            objary_begin = objary_begin.shift::<Address>(1);
+        }
+    } else if (*layout).first_ptr >= 0 {
+        let npointers = (*layout).npointers;
+        let elsize = (*layout).size as usize / std::mem::size_of::<Address>();
+        let length = (*m).length;
+        let mut objary_begin = Address::from_ptr((*m).ptr);
+        let objary_end = objary_begin.shift::<Address>((length * elsize) as isize);
+        if npointers == 1 {
+            objary_begin = objary_begin.shift::<Address>((*layout).first_ptr as isize);
+            while objary_begin < objary_end {
+                process_slot(closure, objary_begin);
+                objary_begin = objary_begin.shift::<Address>(elsize as isize);
+            }
+        } else if (*layout).fielddesc_type_custom() == 0 {
+            let obj8_begin = mmtk_jl_dt_layout_ptrs(layout);
+            let obj8_end = obj8_begin.shift::<u8>(npointers as isize);
+            let mut elem_begin = obj8_begin;
+            let elem_end = obj8_end;
+
+            while objary_begin < objary_end {
+                while elem_begin < elem_end {
+                    let elem_begin_loaded = elem_begin.load::<u8>();
+                    let slot = objary_begin.shift::<Address>(elem_begin_loaded as isize);
+                    process_slot(closure, slot);
+                    elem_begin = elem_begin.shift::<u8>(1);
+                }
+                elem_begin = obj8_begin;
+                objary_begin = objary_begin.shift::<Address>(elsize as isize);
+            }
+        } else if (*layout).fielddesc_type_custom() == 1 {
+            let mut obj16_begin = mmtk_jl_dt_layout_ptrs(layout);
+            let obj16_end = obj16_begin.shift::<u16>(npointers as isize);
+
+            while objary_begin < objary_end {
+                while obj16_begin < obj16_end {
+                    let elem_begin_loaded = obj16_begin.load::<u16>();
+                    let slot = objary_begin.shift::<Address>(elem_begin_loaded as isize);
+                    process_slot(closure, slot);
+                    obj16_begin = obj16_begin.shift::<u16>(1);
+                }
+                obj16_begin = mmtk_jl_dt_layout_ptrs(layout);
+                objary_begin = objary_begin.shift::<Address>(elsize as isize);
+            }
+        } else {
+            unimplemented!();
+        }
+    }
+}
