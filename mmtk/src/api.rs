@@ -18,6 +18,14 @@ use std::ffi::CStr;
 use std::sync::atomic::AtomicIsize;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+// Thread-local dec buffer for LXR RC decrements.
+// Used by jl_gc_mmtk_dec_buf_add and jl_gc_mmtk_dec_buf_flush.
+const DEC_BUFFER_CAPACITY: usize = 4096;
+thread_local! {
+    static DEC_BUFFER: std::cell::RefCell<Vec<ObjectReference>> =
+        std::cell::RefCell::new(Vec::with_capacity(DEC_BUFFER_CAPACITY));
+}
+
 #[no_mangle]
 pub extern "C" fn mmtk_gc_init(
     min_heap_size: usize,
@@ -529,21 +537,49 @@ pub extern "C" fn get_mmtk_version() -> *const c_char {
 
 // ====== LXR-specific FFI exports ======
 
-/// LXR dec buffer: add an object to the thread-local decrement buffer.
-/// Called by the MLIR compiler for RC decrements.
-/// Under non-LXR plans, this is a no-op.
+/// LXR dec buffer: add an object to the decrement buffer for lazy RC processing.
+/// Called by the MLIR compiler for RC decrements (julia.rc.dec ops).
+///
+/// In Perceus-style RC, a decrement happens when a variable goes out of scope.
+/// The object is added to a thread-local buffer. When the buffer is full or at
+/// GC safepoints, the buffer is flushed as a ProcessDecs work packet that is
+/// either processed lazily (concurrent) or at STW (synchronous).
+///
+/// Under non-LXR plans, this is a no-op since tracing GCs don't use RC.
 #[no_mangle]
-pub extern "C" fn jl_gc_mmtk_dec_buf_add(_ptls: *mut libc::c_void, _obj: ObjectReference) {
-    // Under LXR, the dec buffer is managed internally by the barrier semantics.
-    // The MLIR compiler emits rc_dec calls that go through the write barrier's
-    // field-logging mechanism, which handles dec buffer entries automatically.
-    // This function is provided as a direct dec buffer entry point for cases
-    // where the runtime (not the compiler) needs to add entries.
-    #[cfg(feature = "lxr")]
-    {
-        // TODO: Wire to LXR's dec buffer when the full integration path is verified.
-        // For now, the primary dec path is through the field-logging barrier.
-    }
+pub extern "C" fn jl_gc_mmtk_dec_buf_add(_mutator: *mut Mutator<JuliaVM>, obj: ObjectReference) {
+    use mmtk::plan::lxr::rc::ProcessDecs;
+    use mmtk::LazySweepingJobsCounter;
+
+    DEC_BUFFER.with(|buf| {
+        let mut buf = buf.borrow_mut();
+        buf.push(obj);
+        if buf.len() >= DEC_BUFFER_CAPACITY {
+            let decs = std::mem::replace(&mut *buf, Vec::with_capacity(DEC_BUFFER_CAPACITY));
+            let counter = LazySweepingJobsCounter::new_decs();
+            let work = ProcessDecs::<JuliaVM>::new(decs, counter);
+            // Schedule as lazy (concurrent) decrement processing
+            SINGLETON.scheduler.postpone_prioritized(work);
+        }
+    });
+}
+
+/// Flush any remaining dec buffer entries as a ProcessDecs work packet.
+/// Should be called at GC safepoints to ensure all decrements are processed.
+#[no_mangle]
+pub extern "C" fn jl_gc_mmtk_dec_buf_flush() {
+    use mmtk::plan::lxr::rc::ProcessDecs;
+    use mmtk::LazySweepingJobsCounter;
+
+    DEC_BUFFER.with(|buf| {
+        let mut buf = buf.borrow_mut();
+        if !buf.is_empty() {
+            let decs = std::mem::replace(&mut *buf, Vec::with_capacity(DEC_BUFFER_CAPACITY));
+            let counter = LazySweepingJobsCounter::new_decs();
+            let work = ProcessDecs::<JuliaVM>::new(decs, counter);
+            SINGLETON.scheduler.postpone_prioritized(work);
+        }
+    });
 }
 
 /// LXR write barrier pre-write (for field-logging barrier).
