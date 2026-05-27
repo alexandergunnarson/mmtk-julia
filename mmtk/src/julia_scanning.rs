@@ -10,6 +10,9 @@ use mmtk::vm::SlotVisitor;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
+use crate::object_model::VMObjectModel;
+use mmtk::vm::ObjectModel;
+
 use crate::jl_gc_genericmemory_how;
 use crate::jl_gc_get_owner_address_to_mmtk;
 use crate::jl_gc_get_stackbase;
@@ -50,6 +53,75 @@ pub unsafe fn mmtk_jl_typeof(addr: Address) -> *const jl_datatype_t {
     mmtk_jl_to_typeof(mmtk_jl_typetagof(addr))
 }
 
+/// Forwarding-aware variant of `mmtk_jl_typeof`.  Use ONLY during GC
+/// scanning — adds one extra memory load per non-small-tag resolution.
+/// See `mmtk_jl_to_typeof_resolving` for details.
+#[inline(always)]
+pub unsafe fn mmtk_jl_typeof_resolving(addr: Address) -> *const jl_datatype_t {
+    mmtk_jl_to_typeof_resolving(mmtk_jl_typetagof(addr))
+}
+
+/// If `addr` points to a DataType that has been forwarded during nursery evacuation,
+/// follow the forwarding chain and return the address of the live copy.
+/// Otherwise, returns `addr` unchanged.
+///
+/// During nursery evacuation, a DataType D can be copied to D'.  The old location D
+/// has its header overwritten with a forwarding pointer to D'.  Any object whose vtag
+/// still references D will see D's header (now a forwarding pointer) instead of a
+/// valid type tag.  This function detects that condition by checking whether the
+/// value at `addr`'s header is the small tag `jl_datatype_tag` (indicating a valid,
+/// non-forwarded DataType).  If not, the header value is the forwarding pointer, and
+/// we follow it.
+///
+/// CRITICAL: We must NOT use `mmtk_jl_typetagof` to extract the forwarding pointer,
+/// because it masks with `& !0xf` which clears bit 3.  Julia object references are
+/// at offset +8 from the 16-byte-aligned allocation start, so bit 3 of the object
+/// reference is ALWAYS set.  The forwarding pointer is stored with mask
+/// `0x00ff_ffff_ffff_fff8` (preserving bit 3).  We must use that mask to read it.
+#[inline(always)]
+pub unsafe fn resolve_forwarded_datatype_addr(addr: Address) -> Address {
+    let mut resolved = addr;
+    // Bounded loop — normally at most 1 hop (objects are forwarded at most once per
+    // GC cycle).  The bound of 3 is purely defensive.
+    for _ in 0..3 {
+        let dt_vtag = mmtk_jl_typetagof(resolved);
+        if dt_vtag.as_usize() == ((jl_small_typeof_tags_jl_datatype_tag as usize) << 4) {
+            // Valid DataType — its own type tag is the DataType small tag.
+            break;
+        }
+        // The header does not contain the DataType small tag.  During nursery
+        // evacuation this means the object was forwarded: the header contains
+        // the forwarding pointer to the new copy.
+        //
+        // Confirm via the side-metadata forwarding bits (only mapped for Immix).
+        if let Some(obj_ref) = ObjectReference::from_raw_address(resolved) {
+            let fwd_bits =
+                <VMObjectModel as ObjectModel<crate::JuliaVM>>::LOCAL_FORWARDING_BITS_SPEC
+                    .load_atomic::<crate::JuliaVM, u8>(obj_ref, None, Ordering::SeqCst);
+            const FORWARDED: u8 = 0b11;
+            if fwd_bits != FORWARDED {
+                // Not actually forwarded — could be corruption or an unrecognised
+                // tag layout.  Return what we have and let the caller cope.
+                break;
+            }
+        }
+        // Read the forwarding pointer from the header using the correct mask.
+        // The forwarding pointer was stored via LOCAL_FORWARDING_POINTER_SPEC
+        // (in_header(-64)) with FORWARDING_POINTER_MASK = 0x00ff_ffff_ffff_fff8.
+        // We must use this mask — NOT the vtag mask (& !0xf) — because bit 3
+        // encodes whether the object ref is at +8 from the allocation start.
+        const FORWARDING_POINTER_MASK: usize = 0x00ff_ffff_ffff_fff8;
+        let header_addr = resolved.as_usize() - std::mem::size_of::<jl_taggedvalue_t>();
+        let raw_header = Address::from_usize(header_addr).load::<usize>();
+        resolved = Address::from_usize(raw_header & FORWARDING_POINTER_MASK);
+    }
+    resolved
+}
+
+/// Fast type-tag resolution (mutator path).  No forwarding check — zero
+/// overhead beyond the small-tag table lookup.  Safe to call from any
+/// context where DataTypes cannot be forwarded (i.e. outside a STW GC
+/// pause with nursery evacuation).
 #[inline(always)]
 pub unsafe fn mmtk_jl_to_typeof(t: Address) -> *const jl_datatype_t {
     let t_raw = t.as_usize();
@@ -58,6 +130,24 @@ pub unsafe fn mmtk_jl_to_typeof(t: Address) -> *const jl_datatype_t {
         return ty;
     }
     t.to_ptr::<jl_datatype_t>()
+}
+
+/// Forwarding-aware type-tag resolution (GC-only path).  During nursery
+/// evacuation a DataType may be copied and its old header overwritten with
+/// a forwarding pointer.  This variant detects that and follows the chain.
+///
+/// Cost: one extra memory load (`mmtk_jl_typetagof` on the resolved addr)
+/// per non-small-tag resolution, plus side-metadata reads if forwarded.
+/// Only use from GC scanning functions (`scan_julia_object`,
+/// `get_so_object_size`, `copy`, `is_julia_obj_array`, etc.).
+#[inline(always)]
+pub unsafe fn mmtk_jl_to_typeof_resolving(t: Address) -> *const jl_datatype_t {
+    let t_raw = t.as_usize();
+    if t_raw < (JL_MAX_TAGS << 4) {
+        let ty = jl_small_typeof[t_raw / std::mem::size_of::<Address>()];
+        return ty;
+    }
+    resolve_forwarded_datatype_addr(t).to_ptr::<jl_datatype_t>()
 }
 
 const PRINT_OBJ_TYPE: bool = false;
@@ -196,6 +286,12 @@ pub unsafe fn scan_julia_object<SV: SlotVisitor<JuliaVMSlot>>(obj: Address, clos
         }
         return;
     } else {
+        // vtag is a direct pointer to a jl_datatype_t in the heap.
+        // During nursery evacuation, this DataType may itself have been
+        // forwarded — its header is now a forwarding pointer, not a type tag.
+        // Resolve through the forwarding chain before validation.
+        vtag = resolve_forwarded_datatype_addr(vtag);
+
         let vt = vtag.to_ptr::<jl_datatype_t>();
         let type_tag = mmtk_jl_typetagof(vtag);
 
@@ -641,11 +737,10 @@ pub unsafe fn mmtk_jl_bt_entry_jlvalue(
 /// Returns the slot address of the i-th jlvalue in a backtrace entry.
 /// Unlike mmtk_jl_bt_entry_jlvalue (which dereferences the slot to get the object),
 /// this returns the address of the slot itself, for slot-based root reporting.
-pub unsafe fn mmtk_jl_bt_entry_jlvalue_slot(
-    bt_entry: *mut jl_bt_element_t,
-    i: usize,
-) -> Address {
-    Address::from_ptr(std::ptr::addr_of!((*bt_entry.add(2 + i)).__bindgen_anon_1.jlvalue))
+pub unsafe fn mmtk_jl_bt_entry_jlvalue_slot(bt_entry: *mut jl_bt_element_t, i: usize) -> Address {
+    Address::from_ptr(std::ptr::addr_of!(
+        (*bt_entry.add(2 + i)).__bindgen_anon_1.jlvalue
+    ))
 }
 
 // ====== LXR object classification for concurrent marking ======
@@ -657,7 +752,7 @@ use mmtk::vm::ObjectKind;
 /// - Everything else → Scalar
 pub unsafe fn get_julia_obj_kind(object: ObjectReference) -> ObjectKind {
     let obj = object.to_raw_address();
-    let vt = mmtk_jl_typeof(obj);
+    let vt = mmtk_jl_typeof_resolving(obj);
     if vt.is_null() {
         return ObjectKind::Scalar;
     }
@@ -684,6 +779,39 @@ pub unsafe fn get_julia_obj_array_data(object: ObjectReference) -> crate::slots:
         start: data_start,
         count: length,
     }
+}
+
+/// Returns true if the object is a GenericMemory with all-boxed (pointer) elements.
+/// Used by LXR's nursery scanning (`scan_nursery_object` in rc.rs) to select the
+/// chunked obj-array scanning path.
+pub unsafe fn is_julia_obj_array(object: ObjectReference) -> bool {
+    let obj = object.to_raw_address();
+    let vt = mmtk_jl_typeof_resolving(obj);
+    if vt.is_null() {
+        return false;
+    }
+    if (*vt).name == jl_genericmemory_typename {
+        let layout = (*vt).layout;
+        return (*layout).flags.arrayelem_isboxed() != 0;
+    }
+    false
+}
+
+/// Returns true if the object is a GenericMemory with NO pointer fields at all
+/// (pure isbits/value data).  Used by LXR's nursery scanning to skip field
+/// scanning and unlog-bits setup entirely for value-only arrays.
+pub unsafe fn is_julia_val_array(object: ObjectReference) -> bool {
+    let obj = object.to_raw_address();
+    let vt = mmtk_jl_typeof_resolving(obj);
+    if vt.is_null() {
+        return false;
+    }
+    if (*vt).name == jl_genericmemory_typename {
+        let layout = (*vt).layout;
+        // Not boxed and no embedded pointers → pure value array
+        return (*layout).flags.arrayelem_isboxed() == 0 && (*layout).first_ptr < 0;
+    }
+    false
 }
 
 // ====== scan_julia_object_with_type: pre-loaded type pointer ======

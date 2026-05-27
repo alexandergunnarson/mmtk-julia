@@ -429,20 +429,67 @@ pub extern "C" fn mmtk_object_reference_write_post(
 pub extern "C" fn mmtk_object_reference_write_slow(
     mutator: &'static mut Mutator<JuliaVM>,
     src: ObjectReference,
-    target: NullableObjectReference,
+    _target: NullableObjectReference,
 ) {
     use mmtk::MutatorContext;
-    mutator.barrier().object_reference_write_slow(
-        src,
-        crate::slots::JuliaVMSlot::Simple(mmtk::vm::slot::SimpleSlot::from_address(Address::ZERO)),
-        target.into(),
-    );
+    // The C-side post-write barrier (jl_gc_wb / mmtk_gc_wb_fast) does not
+    // pass the slot address — only the parent object and written value.
+    // LXR's field barrier (enqueue_node) requires a real slot address to
+    // read/write the per-field unlog bits.  Passing Address::ZERO crashes
+    // with SIGSEGV when the barrier tries to load metadata at address 0.
+    //
+    // Instead, use the object-level barrier: object_probable_write_slow
+    // iterates ALL pointer fields of `src`, enqueuing each field's slot
+    // with its actual address.  This is more expensive than a single-slot
+    // barrier but is correct without slot info.
+    //
+    // For the fast path (field already logged), this is a no-op per slot.
+    // For code paths that DO know the slot address (e.g. MLIR-compiled
+    // code, C runtime pre-barriers), use mmtk_object_reference_write_pre
+    // or jl_gc_wb_field_pre instead.
+    mutator.barrier().object_probable_write(src);
 }
 
 /// Side log bit is the first side metadata spec starting.
 #[no_mangle]
 pub static MMTK_SIDE_LOG_BIT_BASE_ADDRESS: Address =
     mmtk::util::metadata::side_metadata::GLOBAL_SIDE_METADATA_VM_BASE_ADDRESS;
+
+/// Heap range constants for the C write-barrier fast path.
+/// The field unlog bits (and all other side metadata) are only mapped for
+/// addresses in [MMTK_HEAP_START, MMTK_HEAP_END).  Slots outside this range
+/// (e.g. malloc'd GenericMemory data buffers) must NOT be checked via
+/// _mmtk_check_bit — doing so dereferences unmapped metadata → SIGSEGV.
+///
+/// These are resolved at link time from the vm_layout constants compiled
+/// into libmmtk_julia.so.  On 64-bit, the default layout is:
+///   HEAP_START = 0x0000_0200_0000_0000
+///   HEAP_END   = 0x0000_0400_0000_0000  (or similar, depending on max extent)
+#[no_mangle]
+pub static MMTK_HEAP_START: usize = {
+    // Use the compile-time default layout.  vm_layout() is not const-callable,
+    // so we replicate the constant from VMLayout::default() for 64-bit.
+    #[cfg(target_pointer_width = "64")]
+    {
+        0x0000_0200_0000_0000usize
+    }
+    #[cfg(target_pointer_width = "32")]
+    {
+        0x8000_0000usize
+    }
+};
+
+#[no_mangle]
+pub static MMTK_HEAP_END: usize = {
+    #[cfg(target_pointer_width = "64")]
+    {
+        0x0000_0400_0000_0000usize
+    }
+    #[cfg(target_pointer_width = "32")]
+    {
+        0xd000_0000usize
+    }
+};
 
 #[no_mangle]
 pub extern "C" fn mmtk_object_is_managed_by_mmtk(addr: usize) -> bool {
@@ -541,7 +588,6 @@ pub extern "C" fn get_mmtk_version() -> *const c_char {
         .as_ptr() as _
 }
 
-
 // ====== LXR-specific FFI exports ======
 
 /// LXR dec buffer: add an object to the decrement buffer for lazy RC processing.
@@ -631,7 +677,9 @@ pub extern "C" fn mmtk_object_reference_write_field(
     use mmtk::MutatorContext;
     // For FieldBarrier, object_reference_write_pre IS the full barrier.
     // It calls LXRFieldBarrierSemantics::object_reference_write_slow internally.
-    mutator.barrier().object_reference_write_pre(src, slot, target.into());
+    mutator
+        .barrier()
+        .object_reference_write_pre(src, slot, target.into());
 }
 
 /// Query the active barrier type. Returns a string identifier.

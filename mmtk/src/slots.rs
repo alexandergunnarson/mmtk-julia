@@ -30,6 +30,17 @@ impl Slot for JuliaVMSlot {
             JuliaVMSlot::Offset(e) => e.store(object),
         }
     }
+
+    fn to_address(&self) -> Address {
+        match self {
+            JuliaVMSlot::Simple(e) => e.as_address(),
+            JuliaVMSlot::Offset(e) => e.slot_address(),
+        }
+    }
+
+    fn from_address(addr: Address) -> Self {
+        JuliaVMSlot::Simple(SimpleSlot::from_address(addr))
+    }
 }
 
 impl std::fmt::Debug for JuliaVMSlot {
@@ -141,7 +152,9 @@ impl mmtk::vm::slot::MemorySlice for JuliaMemorySlice {
 
     fn get(&self, index: usize) -> Self::SlotType {
         use mmtk::vm::slot::SimpleSlot;
-        JuliaVMSlot::Simple(SimpleSlot::from_address(self.start.shift::<Address>(index as isize)))
+        JuliaVMSlot::Simple(SimpleSlot::from_address(
+            self.start.shift::<Address>(index as isize),
+        ))
     }
 
     fn copy(src: &Self, tgt: &Self) {

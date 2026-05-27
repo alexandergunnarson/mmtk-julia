@@ -4,14 +4,14 @@ use mmtk::memory_manager;
 use mmtk::scheduler::*;
 use mmtk::util::opaque_pointer::*;
 use mmtk::util::ObjectReference;
+use mmtk::vm::slot::SimpleSlot;
 use mmtk::vm::slot::Slot;
+use mmtk::vm::ObjectKind;
 use mmtk::vm::ObjectTracerContext;
 use mmtk::vm::RootsWorkFactory;
 use mmtk::vm::Scanning;
-use mmtk::vm::ObjectKind;
 use mmtk::vm::SlotVisitor;
 use mmtk::vm::VMBinding;
-use mmtk::vm::slot::SimpleSlot;
 use mmtk::Mutator;
 use mmtk::MMTK;
 
@@ -203,7 +203,6 @@ impl Scanning<JuliaVM> for VMScanning {
 
         const CAPACITY_PER_PACKET: usize = 4096;
 
-
         let all_slots: Vec<JuliaVMSlot> = gcstack_slots
             .buffer
             .into_iter()
@@ -247,6 +246,14 @@ impl Scanning<JuliaVM> for VMScanning {
     }
     fn get_obj_kind(object: ObjectReference) -> ObjectKind {
         unsafe { crate::julia_scanning::get_julia_obj_kind(object) }
+    }
+
+    fn is_obj_array(object: ObjectReference) -> bool {
+        unsafe { crate::julia_scanning::is_julia_obj_array(object) }
+    }
+
+    fn is_val_array(object: ObjectReference) -> bool {
+        unsafe { crate::julia_scanning::is_julia_val_array(object) }
     }
 
     fn obj_array_data(object: ObjectReference) -> crate::slots::JuliaMemorySlice {

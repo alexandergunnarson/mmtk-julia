@@ -39,6 +39,7 @@ nogc = []
 immix = []
 stickyimmix = ["mmtk/sticky_immix_non_moving_nursery", "mmtk/immix_smaller_block", "mmtk/set_unlog_bits_vm_space"]
 lxr = ["mmtk/ix_always_defrag"]
+lxr_no_nursery_evac = ["mmtk/lxr_no_nursery_evac"]
 marksweep = []
 object_pinning = ["mmtk/object_pinning"]
 

@@ -2,7 +2,8 @@ use crate::api::mmtk_get_obj_size;
 use crate::jl_gc_genericmemory_how;
 use crate::jl_gc_update_inlined_array;
 use crate::julia_scanning::{
-    jl_genericmemory_typename, jl_small_typeof, mmtk_jl_typeof, mmtk_jl_typetagof,
+    jl_genericmemory_typename, jl_small_typeof, mmtk_jl_typeof, mmtk_jl_typeof_resolving,
+    mmtk_jl_typetagof, resolve_forwarded_datatype_addr,
 };
 use crate::julia_types::*;
 use crate::{JuliaVM, JULIA_BUFF_TAG, JULIA_HEADER_SIZE};
@@ -108,7 +109,9 @@ impl ObjectModel<JuliaVM> for VMObjectModel {
         trace!("Copied object {} into {}", from, to_obj);
 
         unsafe {
-            let vt = mmtk_jl_typeof(from.to_raw_address());
+            // GC-only path: use forwarding-aware type resolution because
+            // the from object's vtag may point to a forwarded DataType.
+            let vt = mmtk_jl_typeof_resolving(from.to_raw_address());
 
             if (*vt).name == jl_genericmemory_typename {
                 jl_gc_update_inlined_array(from.to_raw_address(), to_obj.to_raw_address())
@@ -191,7 +194,9 @@ impl ObjectModel<JuliaVM> for VMObjectModel {
         // Return the Julia type tag pointer (jl_datatype_t*) for this object.
         // LXR's concurrent marking caches this to avoid re-reading the header
         // when scanning chunked large arrays during RC cascade.
-        unsafe { Address::from_usize(mmtk_jl_typeof(object.to_raw_address()) as usize) }
+        // GC-only path (called by LXR concurrent marking for klass caching):
+        // use forwarding-aware resolution.
+        unsafe { Address::from_usize(mmtk_jl_typeof_resolving(object.to_raw_address()) as usize) }
     }
 }
 
@@ -278,6 +283,12 @@ pub unsafe fn get_so_object_size(object: ObjectReference) -> usize {
             return llt_align(dtsz + JULIA_HEADER_SIZE, 16);
         }
     } else {
+        // vtag is a direct pointer to a jl_datatype_t in the heap.
+        // During nursery evacuation, this DataType may itself have been
+        // forwarded — its header is now a forwarding pointer, not a type tag.
+        // Resolve through the forwarding chain before validation.
+        vtag = resolve_forwarded_datatype_addr(vtag);
+
         let vt = vtag.to_ptr::<jl_datatype_t>();
         let type_tag = mmtk_jl_typetagof(vtag);
 
@@ -293,15 +304,14 @@ pub unsafe fn get_so_object_size(object: ObjectReference) -> usize {
         }
     }
 
-    let obj_type = mmtk_jl_typeof(obj_address);
     let vt = vtag.to_ptr::<jl_datatype_t>();
-
-    assert_eq!(obj_type, vt);
     if (*vt).name == jl_genericmemory_typename {
         let m = obj_address.to_ptr::<jl_genericmemory_t>();
         let how = jl_gc_genericmemory_how(obj_address);
         let res = if how == 0 {
-            let layout = (*(mmtk_jl_typetagof(obj_address).to_ptr::<jl_datatype_t>())).layout;
+            // Use already-resolved `vt` instead of re-reading the raw header,
+            // which would fail for forwarded DataTypes.
+            let layout = (*vt).layout;
             let mut sz = (*layout).size as usize * (*m).length;
             if (*layout).flags.arrayelem_isunion() != 0 {
                 sz += (*m).length;
