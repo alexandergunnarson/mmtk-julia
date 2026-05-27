@@ -8,6 +8,7 @@ use mmtk::vm::slot::Slot;
 use mmtk::vm::ObjectTracerContext;
 use mmtk::vm::RootsWorkFactory;
 use mmtk::vm::Scanning;
+use mmtk::vm::ObjectKind;
 use mmtk::vm::SlotVisitor;
 use mmtk::vm::VMBinding;
 use mmtk::Mutator;
@@ -174,6 +175,15 @@ impl Scanning<JuliaVM> for VMScanning {
     ) {
         process_object(object, slot_visitor);
     }
+    fn get_obj_kind(_o: ObjectReference) -> ObjectKind {
+        // Julia objects are treated as scalars for LXR concurrent marking.
+        // This means large arrays of references won't get the chunked scanning
+        // optimization. This is correct but suboptimal for very large GenericMemory
+        // arrays of boxed references. A future optimization would classify
+        // jl_genericmemory_t objects with pointer elements as ObjArray.
+        ObjectKind::Scalar
+    }
+
     fn notify_initial_thread_scan_complete(_partial_scan: bool, _tls: VMWorkerThread) {
         let sweep_vm_specific_work = SweepVMSpecific::new();
         memory_manager::add_work_packet(
