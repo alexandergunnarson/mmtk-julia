@@ -177,8 +177,11 @@ impl ObjectModel<JuliaVM> for VMObjectModel {
         String::from("<julia object>")
     }
 
-    fn get_class_pointer(_object: ObjectReference) -> Address {
-        Address::ZERO
+    fn get_class_pointer(object: ObjectReference) -> Address {
+        // Return the Julia type tag pointer (jl_datatype_t*) for this object.
+        // LXR's concurrent marking caches this to avoid re-reading the header
+        // when scanning chunked large arrays during RC cascade.
+        unsafe { Address::from_usize(mmtk_jl_typeof(object.to_raw_address()) as usize) }
     }
 }
 

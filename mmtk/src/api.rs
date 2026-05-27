@@ -565,13 +565,17 @@ pub extern "C" fn mmtk_object_reference_write_pre(
     );
 }
 
-/// LXR field-logging write barrier (combined pre+post for field stores).
-/// This is the main barrier entry point for LXR. It:
-/// 1. Checks the unlog bit (fast path)
-/// 2. Logs old value for RC decrement
-/// 3. Logs new value for RC increment  
-/// 4. Marks source for SATB concurrent tracing
-/// 5. Updates remembered set for defragmentation
+/// LXR field-logging write barrier slow path.
+/// This is the main barrier entry point for LXR. Under LXR's FieldBarrier,
+/// object_reference_write_pre dispatches to LXRFieldBarrierSemantics::object_reference_write_slow
+/// which performs all barrier operations in one pass:
+/// 1. Logs old value for RC decrement
+/// 2. Logs new value for RC increment
+/// 3. Marks source for SATB concurrent tracing
+/// 4. Updates remembered set for defragmentation
+///
+/// NOTE: FieldBarrier::object_reference_write_post is unimplemented!() — do NOT call it.
+/// The pre-barrier handles everything for field-logging barriers.
 #[no_mangle]
 pub extern "C" fn mmtk_object_reference_write_field(
     mutator: *mut Mutator<JuliaVM>,
@@ -582,10 +586,9 @@ pub extern "C" fn mmtk_object_reference_write_field(
     let mutator = unsafe { &mut *mutator };
     let slot = crate::slots::JuliaVMSlot::Simple(mmtk::vm::slot::SimpleSlot::from_address(slot));
     use mmtk::MutatorContext;
-    // Pre-barrier (SATB snapshot: log old value)
+    // For FieldBarrier, object_reference_write_pre IS the full barrier.
+    // It calls LXRFieldBarrierSemantics::object_reference_write_slow internally.
     mutator.barrier().object_reference_write_pre(src, slot, target.into());
-    // Post-barrier (RC increment tracking)
-    mutator.barrier().object_reference_write_post(src, slot, target.into());
 }
 
 /// Query the active barrier type. Returns a string identifier.
