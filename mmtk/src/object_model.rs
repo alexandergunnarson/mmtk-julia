@@ -62,6 +62,16 @@ impl ObjectModel<JuliaVM> for VMObjectModel {
     #[cfg(feature = "object_pinning")]
     const LOCAL_PINNING_BIT_SPEC: VMLocalPinningBitSpec = LOCAL_PINNING_METADATA_BITS_SPEC;
 
+    fn try_copy(
+        from: ObjectReference,
+        semantics: CopySemantics,
+        copy_context: &mut GCWorkerCopyContext<JuliaVM>,
+    ) -> Option<ObjectReference> {
+        // Delegate to the infallible copy() implementation.
+        // Julia's copy always succeeds (alloc_copy never returns zero).
+        Some(Self::copy(from, semantics, copy_context))
+    }
+
     fn copy(
         from: ObjectReference,
         semantics: CopySemantics,
