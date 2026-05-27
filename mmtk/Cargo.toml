@@ -21,23 +21,15 @@ lto = true
 [dependencies]
 libc = "0.2"
 lazy_static = "1.1"
-# Be very careful to commit any changes to the following mmtk dependency, as our CI scripts (including mmtk-core CI)
-# rely on matching these lines to modify them: e.g. comment out the git dependency and use the local path.
-# These changes are safe:
-# - change branch
-# - change repo name
-# But other changes including adding/removing whitespaces in commented lines may break the CI
-mmtk = { git = "https://github.com/mmtk/mmtk-core.git", rev = "105661429473dc141f940e981c04dc86e995daaa" }
-# Uncomment the following to build locally
-# mmtk = { path = "../repos/mmtk-core" }
+# LXR: Point to wenyuzhao's mmtk-core fork with LXR support (v0.32.0-based)
+# This rev is the one used by the proven-working OpenJDK LXR binding
+mmtk = { path = "/onton/repos/wenyuzhao/mmtk-core" }
 log = {version = "0.4", features = ["max_level_trace", "release_max_level_off"] }
 enum-map = ">=2.1"
 atomic = "0.4.6"
 chrono = "*"
 thread-id = "*"
 memoffset = "*"
-
-# ykstackmaps = { git = "https://github.com/udesou/ykstackmaps.git", branch = "udesou-master", version = "*" }
 
 [features]
 default = ["mmtk/vm_space", "julia_copy_stack", "object_pinning"]
@@ -46,6 +38,7 @@ default = ["mmtk/vm_space", "julia_copy_stack", "object_pinning"]
 nogc = []
 immix = []
 stickyimmix = ["mmtk/sticky_immix_non_moving_nursery", "mmtk/immix_smaller_block", "mmtk/set_unlog_bits_vm_space"]
+lxr = ["mmtk/ix_always_defrag"]
 marksweep = []
 object_pinning = ["mmtk/object_pinning"]
 

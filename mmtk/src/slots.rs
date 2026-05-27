@@ -98,6 +98,7 @@ pub struct JuliaMemorySlice {
 impl mmtk::vm::slot::MemorySlice for JuliaMemorySlice {
     type SlotType = JuliaVMSlot;
     type SlotIterator = JuliaMemorySliceSlotIterator;
+    type ChunkIterator = std::vec::IntoIter<Self>;
 
     fn iter_slots(&self) -> Self::SlotIterator {
         JuliaMemorySliceSlotIterator {
@@ -116,6 +117,31 @@ impl mmtk::vm::slot::MemorySlice for JuliaMemorySlice {
 
     fn bytes(&self) -> usize {
         self.count << mmtk::util::constants::LOG_BYTES_IN_ADDRESS
+    }
+
+    fn chunks(&self, chunk_size: usize) -> Self::ChunkIterator {
+        let total_slots = self.count;
+        let mut chunks = vec![];
+        let mut offset = 0;
+        while offset < total_slots {
+            let chunk_count = std::cmp::min(chunk_size, total_slots - offset);
+            chunks.push(JuliaMemorySlice {
+                owner: self.owner,
+                start: self.start.shift::<Address>(offset as isize),
+                count: chunk_count,
+            });
+            offset += chunk_count;
+        }
+        chunks.into_iter()
+    }
+
+    fn len(&self) -> usize {
+        self.count
+    }
+
+    fn get(&self, index: usize) -> Self::SlotType {
+        use mmtk::vm::slot::SimpleSlot;
+        JuliaVMSlot::Simple(SimpleSlot::from_address(self.start.shift::<Address>(index as isize)))
     }
 
     fn copy(src: &Self, tgt: &Self) {
@@ -240,7 +266,7 @@ impl RootsWorkClosure {
                 .map(|addr| JuliaVMSlot::Simple(SimpleSlot::from_address(addr)))
                 .collect();
             let factory: &mut F = unsafe { &mut *(factory_ptr as *mut F) };
-            factory.create_process_roots_work(buf);
+            factory.create_process_roots_work(buf, mmtk::scheduler::RootKind::Strong);
         }
 
         if renew {

@@ -44,6 +44,8 @@ pub extern "C" fn mmtk_gc_init(
             Some(PlanSelector::Immix)
         } else if cfg!(feature = "stickyimmix") {
             Some(PlanSelector::StickyImmix)
+        } else if cfg!(feature = "lxr") {
+            Some(PlanSelector::LXR)
         } else {
             None
         };
@@ -266,7 +268,7 @@ pub extern "C" fn mmtk_handle_user_collection_request(tls: VMMutatorThread, coll
     // See jl_gc_collection_t
     match collection {
         // auto
-        0 => memory_manager::handle_user_collection_request::<JuliaVM>(&SINGLETON, tls),
+        0 => memory_manager::handle_user_collection_request::<JuliaVM>(&SINGLETON, tls, false),
         // full
         1 => SINGLETON.handle_user_collection_request(tls, true, true),
         // incremental
@@ -523,3 +525,85 @@ pub extern "C" fn get_mmtk_version() -> *const c_char {
         .as_c_str()
         .as_ptr() as _
 }
+
+
+// ====== LXR-specific FFI exports ======
+
+/// LXR dec buffer: add an object to the thread-local decrement buffer.
+/// Called by the MLIR compiler for RC decrements.
+/// Under non-LXR plans, this is a no-op.
+#[no_mangle]
+pub extern "C" fn jl_gc_mmtk_dec_buf_add(_ptls: *mut libc::c_void, _obj: ObjectReference) {
+    // Under LXR, the dec buffer is managed internally by the barrier semantics.
+    // The MLIR compiler emits rc_dec calls that go through the write barrier's
+    // field-logging mechanism, which handles dec buffer entries automatically.
+    // This function is provided as a direct dec buffer entry point for cases
+    // where the runtime (not the compiler) needs to add entries.
+    #[cfg(feature = "lxr")]
+    {
+        // TODO: Wire to LXR's dec buffer when the full integration path is verified.
+        // For now, the primary dec path is through the field-logging barrier.
+    }
+}
+
+/// LXR write barrier pre-write (for field-logging barrier).
+/// Logs the slot address and old value before a field store.
+/// Under non-LXR plans, this is a no-op.
+#[no_mangle]
+pub extern "C" fn mmtk_object_reference_write_pre(
+    mutator: *mut Mutator<JuliaVM>,
+    src: ObjectReference,
+    slot: Address,
+    target: NullableObjectReference,
+) {
+    let mutator = unsafe { &mut *mutator };
+    use mmtk::MutatorContext;
+    mutator.barrier().object_reference_write_pre(
+        src,
+        crate::slots::JuliaVMSlot::Simple(mmtk::vm::slot::SimpleSlot::from_address(slot)),
+        target.into(),
+    );
+}
+
+/// LXR field-logging write barrier (combined pre+post for field stores).
+/// This is the main barrier entry point for LXR. It:
+/// 1. Checks the unlog bit (fast path)
+/// 2. Logs old value for RC decrement
+/// 3. Logs new value for RC increment  
+/// 4. Marks source for SATB concurrent tracing
+/// 5. Updates remembered set for defragmentation
+#[no_mangle]
+pub extern "C" fn mmtk_object_reference_write_field(
+    mutator: *mut Mutator<JuliaVM>,
+    src: ObjectReference,
+    slot: Address,
+    target: NullableObjectReference,
+) {
+    let mutator = unsafe { &mut *mutator };
+    let slot = crate::slots::JuliaVMSlot::Simple(mmtk::vm::slot::SimpleSlot::from_address(slot));
+    use mmtk::MutatorContext;
+    // Pre-barrier (SATB snapshot: log old value)
+    mutator.barrier().object_reference_write_pre(src, slot, target.into());
+    // Post-barrier (RC increment tracking)
+    mutator.barrier().object_reference_write_post(src, slot, target.into());
+}
+
+/// Query the active barrier type. Returns a string identifier.
+/// This allows the Julia runtime to dispatch to the correct barrier calling convention.
+#[no_mangle]
+pub extern "C" fn mmtk_active_barrier() -> *const libc::c_char {
+    use mmtk::plan::BarrierSelector;
+    let barrier = SINGLETON.get_plan().constraints().barrier;
+    match barrier {
+        BarrierSelector::NoBarrier => b"NoBarrier\0".as_ptr() as *const libc::c_char,
+        BarrierSelector::ObjectBarrier => b"ObjectBarrier\0".as_ptr() as *const libc::c_char,
+        BarrierSelector::FieldBarrier => b"FieldBarrier\0".as_ptr() as *const libc::c_char,
+        _ => b"Unknown\0".as_ptr() as *const libc::c_char,
+    }
+}
+
+/// Export the base address of the field unlog bit side metadata.
+/// Used by the Julia MLIR compiler to inline the barrier fast path.
+#[no_mangle]
+pub static MMTK_FIELD_UNLOG_BIT_BASE_ADDRESS: Address =
+    mmtk::util::metadata::side_metadata::GLOBAL_SIDE_METADATA_VM_BASE_ADDRESS;

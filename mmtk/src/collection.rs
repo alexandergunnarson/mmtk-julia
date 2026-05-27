@@ -40,7 +40,7 @@ pub(crate) fn is_gc_thread() -> bool {
 pub struct VMCollection {}
 
 impl Collection<JuliaVM> for VMCollection {
-    fn stop_all_mutators<F>(_tls: VMWorkerThread, mut mutator_visitor: F)
+    fn stop_all_mutators<F>(_tls: VMWorkerThread, mut mutator_visitor: F, _second_stw: bool)
     where
         F: FnMut(&'static mut Mutator<JuliaVM>),
     {

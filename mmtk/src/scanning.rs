@@ -32,7 +32,7 @@ impl Scanning<JuliaVM> for VMScanning {
             pub buffer: Vec<ObjectReference>,
         }
         impl mmtk::vm::SlotVisitor<JuliaVMSlot> for SlotBuffer {
-            fn visit_slot(&mut self, slot: JuliaVMSlot) {
+            fn visit_slot(&mut self, slot: JuliaVMSlot, _out_of_heap: bool) {
                 match slot {
                     JuliaVMSlot::Simple(se) => {
                         if let Some(object) = se.load() {
@@ -159,10 +159,18 @@ impl Scanning<JuliaVM> for VMScanning {
         }
     }
 
-    fn scan_object<SV: SlotVisitor<JuliaVMSlot>>(
+    fn scan_object(
         _tls: VMWorkerThread,
         object: ObjectReference,
-        slot_visitor: &mut SV,
+        slot_visitor: &mut impl SlotVisitor<JuliaVMSlot>,
+    ) {
+        process_object(object, slot_visitor);
+    }
+    fn scan_object_with_klass(
+        _tls: VMWorkerThread,
+        object: ObjectReference,
+        slot_visitor: &mut impl SlotVisitor<JuliaVMSlot>,
+        _klass: mmtk::util::Address,
     ) {
         process_object(object, slot_visitor);
     }
@@ -198,7 +206,7 @@ impl Scanning<JuliaVM> for VMScanning {
     }
 }
 
-pub fn process_object<EV: SlotVisitor<JuliaVMSlot>>(object: ObjectReference, closure: &mut EV) {
+pub fn process_object(object: ObjectReference, closure: &mut impl SlotVisitor<JuliaVMSlot>) {
     let addr = object.to_raw_address();
     unsafe {
         crate::julia_scanning::scan_julia_object(addr, closure);

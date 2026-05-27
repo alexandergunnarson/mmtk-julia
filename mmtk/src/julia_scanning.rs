@@ -520,7 +520,7 @@ pub fn process_slot<EV: SlotVisitor<JuliaVMSlot>>(closure: &mut EV, slot: Addres
         }
     }
 
-    closure.visit_slot(JuliaVMSlot::Simple(simple_slot));
+    closure.visit_slot(JuliaVMSlot::Simple(simple_slot), false);
 }
 
 #[inline(always)]
@@ -544,7 +544,7 @@ pub fn process_offset_slot<EV: SlotVisitor<JuliaVMSlot>>(
         }
     }
 
-    closure.visit_slot(JuliaVMSlot::Offset(offset_slot));
+    closure.visit_slot(JuliaVMSlot::Offset(offset_slot), false);
 }
 
 #[inline(always)]

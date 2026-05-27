@@ -18,6 +18,11 @@ pub struct VMObjectModel {}
 /// 1 bit per object
 pub(crate) const LOGGING_SIDE_METADATA_SPEC: VMGlobalLogBitSpec = VMGlobalLogBitSpec::side_first();
 
+/// Global field-level unlog bit metadata spec (for LXR field-logging barrier)
+/// 1 bit per pointer-sized slot
+pub(crate) const FIELD_LOGGING_SIDE_METADATA_SPEC: VMGlobalFieldUnlogBitSpec =
+    VMGlobalFieldUnlogBitSpec::side_first();
+
 pub(crate) const MARKING_METADATA_SPEC: VMLocalMarkBitSpec =
     VMLocalMarkBitSpec::side_after(LOS_METADATA_SPEC.as_spec());
 
@@ -38,6 +43,7 @@ pub(crate) const LOS_METADATA_SPEC: VMLocalLOSMarkNurserySpec =
 
 impl ObjectModel<JuliaVM> for VMObjectModel {
     const GLOBAL_LOG_BIT_SPEC: VMGlobalLogBitSpec = LOGGING_SIDE_METADATA_SPEC;
+    const GLOBAL_FIELD_UNLOG_BIT_SPEC: VMGlobalFieldUnlogBitSpec = FIELD_LOGGING_SIDE_METADATA_SPEC;
     const LOCAL_FORWARDING_POINTER_SPEC: VMLocalForwardingPointerSpec =
         VMLocalForwardingPointerSpec::in_header(-64);
 
@@ -165,6 +171,14 @@ impl ObjectModel<JuliaVM> for VMObjectModel {
 
     fn dump_object(_object: ObjectReference) {
         unimplemented!()
+    }
+
+    fn dump_object_s(_object: ObjectReference) -> String {
+        String::from("<julia object>")
+    }
+
+    fn get_class_pointer(_object: ObjectReference) -> Address {
+        Address::ZERO
     }
 }
 

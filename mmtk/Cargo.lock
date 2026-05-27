@@ -423,6 +423,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
 
 [[package]]
+name = "humantime"
+version = "2.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "135b12329e5e3ce057a9f972339ea52bc954fe1e9358ef27f95e89716fbc5424"
+
+[[package]]
 name = "iana-time-zone"
 version = "0.1.65"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -718,7 +724,6 @@ checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 [[package]]
 name = "mmtk"
 version = "0.32.0"
-source = "git+https://github.com/mmtk/mmtk-core.git?rev=105661429473dc141f940e981c04dc86e995daaa#105661429473dc141f940e981c04dc86e995daaa"
 dependencies = [
  "atomic 0.6.1",
  "atomic-traits",
@@ -731,6 +736,7 @@ dependencies = [
  "downcast-rs",
  "enum-map",
  "env_logger",
+ "humantime",
  "is-terminal",
  "itertools 0.14.0",
  "lazy_static",
@@ -741,11 +747,9 @@ dependencies = [
  "num-traits",
  "num_cpus",
  "portable-atomic",
- "probe",
  "regex",
  "rustversion",
  "spin",
- "static_assertions",
  "strum",
  "strum_macros",
  "sysinfo",
@@ -772,7 +776,6 @@ dependencies = [
 [[package]]
 name = "mmtk-macros"
 version = "0.32.0"
-source = "git+https://github.com/mmtk/mmtk-core.git?rev=105661429473dc141f940e981c04dc86e995daaa#105661429473dc141f940e981c04dc86e995daaa"
 dependencies = [
  "proc-macro-error",
  "proc-macro2",
@@ -894,12 +897,6 @@ dependencies = [
  "proc-macro2",
  "syn 2.0.114",
 ]
-
-[[package]]
-name = "probe"
-version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "136558b6e1ebaecc92755d0ffaf9421f519531bed30cc2ad23b22cb00965cc5e"
 
 [[package]]
 name = "proc-macro-error"
@@ -1066,12 +1063,6 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
-
-[[package]]
-name = "static_assertions"
-version = "1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "strum"
