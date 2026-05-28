@@ -12,6 +12,19 @@ use mmtk::{
 pub enum JuliaVMSlot {
     Simple(SimpleSlot),
     Offset(OffsetSlot),
+    /// Carries a captured object reference directly, without an underlying
+    /// memory slot.  Used for non-heap slot barriers (external GenericMemory
+    /// data with how!=0) where the new value is known at barrier time.
+    ///
+    /// At GC time, `load()` returns the captured value without any memory
+    /// read — this avoids re-reading a non-heap slot that may have been
+    /// overwritten (which would cause RC overcount from duplicate incs).
+    ///
+    /// `to_address()` returns `Address::ZERO` so that:
+    /// - `unlog_and_load_rc_object` skips `unlog_field_relaxed` (heap range guard)
+    /// - `record_mature_evac_remset` skips (address_in_defrag → false)
+    /// - `store()` is a no-op (no slot to update)
+    Direct(ObjectReference),
 }
 
 unsafe impl Send for JuliaVMSlot {}
@@ -21,6 +34,7 @@ impl Slot for JuliaVMSlot {
         match self {
             JuliaVMSlot::Simple(e) => e.load(),
             JuliaVMSlot::Offset(e) => e.load(),
+            JuliaVMSlot::Direct(o) => Some(*o),
         }
     }
 
@@ -28,6 +42,10 @@ impl Slot for JuliaVMSlot {
         match self {
             JuliaVMSlot::Simple(e) => e.store(object),
             JuliaVMSlot::Offset(e) => e.store(object),
+            // No-op: the actual non-heap slot is written by C code after
+            // the barrier returns.  Direct slots exist only to carry the
+            // captured value through the incs queue without re-reading.
+            JuliaVMSlot::Direct(_) => {}
         }
     }
 
@@ -35,6 +53,18 @@ impl Slot for JuliaVMSlot {
         match self {
             JuliaVMSlot::Simple(e) => e.as_address(),
             JuliaVMSlot::Offset(e) => e.slot_address(),
+            // Sentinel: Address::ZERO is outside the heap range, so all
+            // heap-range-guarded operations (unlog_field_relaxed,
+            // address_in_defrag, record_mature_evac_remset) skip cleanly.
+            JuliaVMSlot::Direct(_) => Address::ZERO,
+        }
+    }
+
+    fn raw_address(&self) -> Address {
+        match self {
+            JuliaVMSlot::Simple(e) => e.as_address(),
+            JuliaVMSlot::Offset(e) => e.slot_address(),
+            JuliaVMSlot::Direct(_) => Address::ZERO,
         }
     }
 
@@ -48,6 +78,7 @@ impl std::fmt::Debug for JuliaVMSlot {
         match self {
             Self::Simple(e) => write!(f, "{}", e.as_address()),
             Self::Offset(e) => write!(f, "{}+{}", e.slot_address(), e.offset),
+            Self::Direct(o) => write!(f, "Direct({:?})", o),
         }
     }
 }

@@ -254,7 +254,10 @@ pub unsafe fn scan_julia_object<SV: SlotVisitor<JuliaVMSlot>>(obj: Address, clos
                         println!(" - scan usings: {:?}\n", objary_begin);
                     }
                     process_slot(closure, objary_begin);
-                    objary_begin = objary_begin.shift::<Address>(4);
+                    // _jl_module_using is 3 pointers: { mod, min_world, max_world }
+                    // Only `mod` (the first field) is a GC pointer.
+                    // Step by 3 to advance to the next struct entry.
+                    objary_begin = objary_begin.shift::<Address>(3);
                 }
             }
         } else if vtag_usize == ((jl_small_typeof_tags_jl_task_tag as usize) << 4) {

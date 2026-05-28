@@ -32,16 +32,21 @@ thread-id = "*"
 memoffset = "*"
 
 [features]
-default = ["mmtk/vm_space", "julia_copy_stack", "object_pinning"]
+default = ["mmtk/vm_space", "mmtk/set_unlog_bits_vm_space", "julia_copy_stack", "mmtk/object_pinning", "mmtk/is_mmtk_object", "mmtk/vo_bit_access", "address_based_hashing"]
 
 # Plans
 nogc = []
 immix = []
 stickyimmix = ["mmtk/sticky_immix_non_moving_nursery", "mmtk/immix_smaller_block", "mmtk/set_unlog_bits_vm_space"]
-lxr = ["mmtk/ix_always_defrag"]
+lxr = ["mmtk/ix_always_defrag", "mmtk/set_unlog_bits_vm_space"]
 lxr_no_nursery_evac = ["mmtk/lxr_no_nursery_evac"]
+lxr_no_mature_evac = ["mmtk/lxr_no_mature_evac"]
+lxr_no_evac = ["mmtk/lxr_no_evac"]
+lxr_no_cm = ["mmtk/lxr_no_cm"]
+lxr_stw = ["mmtk/lxr_stw"]
 marksweep = []
 object_pinning = ["mmtk/object_pinning"]
+address_based_hashing = []
 
 # This feature disables moving
 non_moving = ["mmtk/immix_non_moving", "mmtk/immix_smaller_block"]

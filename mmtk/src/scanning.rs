@@ -156,6 +156,24 @@ impl Scanning<JuliaVM> for VMScanning {
         mutator: &'static mut Mutator<JuliaVM>,
         mut factory: impl RootsWorkFactory<JuliaVMSlot>,
     ) {
+        // Flush the thread-local DEC_BUFFER and NONHEAP_INC_BUFFER before
+        // root scanning begins.  These buffers are populated by
+        // mmtk_object_reference_write_pre_nonheap (non-heap slot write
+        // barriers for external GenericMemory data buffers) and by
+        // jl_gc_mmtk_dec_buf_add (MLIR RC dec ops).  During bootstrap
+        // (interpreter-only, no MLIR code), jl_gc_mmtk_dec_buf_flush is
+        // never called from Julia, so partial buffers accumulate
+        // indefinitely.  Without flushing here:
+        //   - NONHEAP_INC_BUFFER entries are lost → new values from
+        //     non-heap slot writes never get RC-incremented → systematic
+        //     RC undercount → premature free → cascading corruption.
+        //   - DEC_BUFFER entries are lost → old values never get RC-
+        //     decremented → RC overcount (leak, less severe).
+        // Flushing at the start of root scanning ensures all barrier-
+        // generated inc/dec work packets are scheduled before the GC
+        // processes roots and sweeps.
+        crate::api::jl_gc_mmtk_dec_buf_flush();
+
         let ptls: &mut crate::julia_types::_jl_tls_states_t =
             unsafe { std::mem::transmute(mutator.mutator_tls) };
 
@@ -189,6 +207,12 @@ impl Scanning<JuliaVM> for VMScanning {
         mutators: Vec<VMMutatorThread>,
         mut factory: impl RootsWorkFactory<JuliaVMSlot>,
     ) {
+        // Flush thread-local barrier buffers — same rationale as in
+        // scan_roots_in_mutator_thread above.  This path is used when
+        // multiple mutator threads are scanned together (the common case
+        // under LXR's ScanMultipleStacks).
+        crate::api::jl_gc_mmtk_dec_buf_flush();
+
         let mut gcstack_slots = GCStackSlotBuffer { buffer: vec![] };
         let mut root_slots: Vec<JuliaVMSlot> = vec![];
 
