@@ -26,6 +26,41 @@ thread_local! {
         std::cell::RefCell::new(Vec::with_capacity(DEC_BUFFER_CAPACITY));
 }
 
+// Thread-local inc buffer for non-heap slot barriers (LXR).
+// Accumulates JuliaVMSlot::Direct(new_value) entries from non-heap slot
+// writes.  Flushed as ProcessIncs work packets during jl_gc_mmtk_dec_buf_flush
+// (at GC safepoints).  This avoids going through enqueue_node's non-heap path
+// which would push the slot to both decs AND incs — causing the new value's
+// dec and inc to cancel out (net RC change = 0, wrong).  Instead, the old
+// value is pushed separately to DEC_BUFFER via the same function, and the
+// Direct(new_value) here ensures exactly +1 RC for the new value.
+const NONHEAP_INC_CAPACITY: usize = 4096;
+thread_local! {
+    static NONHEAP_INC_BUFFER: std::cell::RefCell<Vec<crate::slots::JuliaVMSlot>> =
+        std::cell::RefCell::new(Vec::with_capacity(NONHEAP_INC_CAPACITY));
+}
+
+fn flush_nonheap_inc_buffer(buf: &mut Vec<crate::slots::JuliaVMSlot>) {
+    if buf.is_empty() {
+        return;
+    }
+    use mmtk::plan::lxr::rc::{ProcessIncs, EDGE_KIND_MATURE};
+    use mmtk::plan::lxr::LXR;
+    use mmtk::scheduler::WorkBucketStage;
+    let incs = std::mem::replace(buf, Vec::with_capacity(NONHEAP_INC_CAPACITY));
+    let lxr: &'static LXR<JuliaVM> = SINGLETON.get_plan().downcast_ref().unwrap();
+    let work = ProcessIncs::<JuliaVM, { EDGE_KIND_MATURE }>::new(incs, lxr);
+    // Schedule to RCProcessIncs bucket — the same bucket used by the regular
+    // barrier's flush_incs().  ProcessIncs::do_work requires current_pause()
+    // to be set, which is only true during a GC pause.  The RCProcessIncs
+    // bucket is opened during every GC pause, so the work will be processed
+    // at the correct time.  Using postpone_prioritized was wrong because that
+    // path moves work to STWRCDecsAndSweep (which may be disabled for
+    // non-Full pauses under LAZY_DECREMENTS), and the work could end up
+    // running outside a pause context where current_pause() returns None.
+    SINGLETON.scheduler.work_buckets[WorkBucketStage::RCProcessIncs].add(work);
+}
+
 #[no_mangle]
 pub extern "C" fn mmtk_gc_init(
     min_heap_size: usize,
@@ -113,6 +148,27 @@ pub extern "C" fn mmtk_gc_init(
     assert!(!crate::MMTK_INITIALIZED.load(Ordering::SeqCst));
     // Make sure we initialize MMTk here
     lazy_static::initialize(&SINGLETON);
+
+    // Runtime-initialize the heap range constants used by the C write-barrier
+    // fast path.  vm_layout() is valid now that MMTk is initialized.
+    // This must happen before any write barrier fires (i.e. before the first
+    // allocation that stores a pointer into a heap field).
+    //
+    // The range must cover exactly the contiguous spaces that have field unlog
+    // bit metadata committed: Immix (space 0), Immortal (space 1), LOS
+    // (space 2) — 3 spaces of max_space_extent each.  Using the wider
+    // vm_layout().heap_end (0x2200...) would accept addresses in uncommitted
+    // metadata regions between the last space and the end of the potential
+    // address space, causing SIGSEGV on unlog bit reads.
+    {
+        use mmtk::util::heap::layout::vm_layout::vm_layout;
+        let layout = vm_layout();
+        let start = layout.heap_start.as_usize();
+        let extent = layout.max_space_extent();
+        MMTK_HEAP_START.store(start, Ordering::Relaxed);
+        // 3 contiguous spaces: Immix + Immortal + LOS
+        MMTK_HEAP_END.store(start + 3 * extent, Ordering::Relaxed);
+    }
 
     // Initialize GC timing infrastructure.  The LXR fork's Timer uses
     // Option<Instant> which panics on unwrap if not initialized.
@@ -455,41 +511,26 @@ pub extern "C" fn mmtk_object_reference_write_slow(
 pub static MMTK_SIDE_LOG_BIT_BASE_ADDRESS: Address =
     mmtk::util::metadata::side_metadata::GLOBAL_SIDE_METADATA_VM_BASE_ADDRESS;
 
-/// Heap range constants for the C write-barrier fast path.
-/// The field unlog bits (and all other side metadata) are only mapped for
-/// addresses in [MMTK_HEAP_START, MMTK_HEAP_END).  Slots outside this range
-/// (e.g. malloc'd GenericMemory data buffers) must NOT be checked via
-/// _mmtk_check_bit — doing so dereferences unmapped metadata → SIGSEGV.
+/// Heap range for the C write-barrier fast path.
 ///
-/// These are resolved at link time from the vm_layout constants compiled
-/// into libmmtk_julia.so.  On 64-bit, the default layout is:
-///   HEAP_START = 0x0000_0200_0000_0000
-///   HEAP_END   = 0x0000_0400_0000_0000  (or similar, depending on max extent)
+/// Runtime-initialized from `vm_layout()` during `mmtk_gc_init`, after MMTk
+/// is fully set up.  The range [MMTK_HEAP_START, MMTK_HEAP_END) covers
+/// exactly the 3 contiguous spaces (Immix, Immortal, LOS) computed as
+/// `heap_start + 3 * max_space_extent`.  This is tight: any address in this
+/// range has field unlog bit metadata committed; any address outside does not.
+///
+/// Slots outside this range (malloc'd GenericMemory data buffers, C stack,
+/// etc.) must NOT be checked via `_mmtk_check_bit`.
+///
+/// These are `AtomicUsize` so Rust can write them once during init while C
+/// reads them on every barrier call.  On x86-64, `AtomicUsize` has identical
+/// size/alignment to `usize`; C reads them as plain `uintptr_t` loads.
+/// After init the values never change, so no synchronization overhead.
 #[no_mangle]
-pub static MMTK_HEAP_START: usize = {
-    // Use the compile-time default layout.  vm_layout() is not const-callable,
-    // so we replicate the constant from VMLayout::default() for 64-bit.
-    #[cfg(target_pointer_width = "64")]
-    {
-        0x0000_0200_0000_0000usize
-    }
-    #[cfg(target_pointer_width = "32")]
-    {
-        0x8000_0000usize
-    }
-};
+pub static MMTK_HEAP_START: AtomicUsize = AtomicUsize::new(0);
 
 #[no_mangle]
-pub static MMTK_HEAP_END: usize = {
-    #[cfg(target_pointer_width = "64")]
-    {
-        0x0000_0400_0000_0000usize
-    }
-    #[cfg(target_pointer_width = "32")]
-    {
-        0xd000_0000usize
-    }
-};
+pub static MMTK_HEAP_END: AtomicUsize = AtomicUsize::new(0);
 
 #[no_mangle]
 pub extern "C" fn mmtk_object_is_managed_by_mmtk(addr: usize) -> bool {
@@ -617,8 +658,9 @@ pub extern "C" fn jl_gc_mmtk_dec_buf_add(_mutator: *mut Mutator<JuliaVM>, obj: O
     });
 }
 
-/// Flush any remaining dec buffer entries as a ProcessDecs work packet.
-/// Should be called at GC safepoints to ensure all decrements are processed.
+/// Flush any remaining dec buffer entries as a ProcessDecs work packet,
+/// and any non-heap inc buffer entries as a ProcessIncs work packet.
+/// Should be called at GC safepoints to ensure all RC operations are processed.
 #[no_mangle]
 pub extern "C" fn jl_gc_mmtk_dec_buf_flush() {
     use mmtk::plan::lxr::rc::ProcessDecs;
@@ -633,6 +675,76 @@ pub extern "C" fn jl_gc_mmtk_dec_buf_flush() {
             SINGLETON.scheduler.postpone_prioritized(work);
         }
     });
+
+    NONHEAP_INC_BUFFER.with(|buf| {
+        let mut buf = buf.borrow_mut();
+        flush_nonheap_inc_buffer(&mut buf);
+    });
+}
+
+/// LXR write barrier for non-heap slots (e.g., external GenericMemory data).
+///
+/// Called BEFORE writing a pointer to a slot that is NOT in the MMTk managed
+/// heap (e.g., malloc'd GenericMemory data buffers with `how != 0`).  The
+/// caller provides the explicit old value (read from the slot before the
+/// store) and the new value about to be stored.
+///
+/// This bypasses the generic barrier path (`enqueue_node`) entirely to avoid
+/// two problems:
+/// 1. **One-shot degradation (HANDOFF §53):** The old fallback to
+///    `jl_gc_wb`/`object_probable_write` logged ALL fields of the parent,
+///    causing subsequent writes to other in-heap fields to be silently missed.
+/// 2. **RC overcount from slot re-reads:** Pushing the non-heap slot to the
+///    incs queue causes `ProcessIncs` to re-read the slot at GC time.  For
+///    repeated writes, the same final value is read N times → overcount by
+///    N−1.  Using `JuliaVMSlot::Direct(new_val)` captures the value at
+///    barrier time — each (old, new) pair produces exactly −1/+1 RC, with
+///    no overcount.
+///
+/// The old value is pushed to `DEC_BUFFER` (same mechanism as
+/// `jl_gc_mmtk_dec_buf_add`).  The new value is wrapped in
+/// `JuliaVMSlot::Direct` and pushed to `NONHEAP_INC_BUFFER`, flushed as
+/// `ProcessIncs` work packets at GC safepoints.  At GC time,
+/// `Direct::load()` returns the captured value without any memory read;
+/// `Direct::to_address()` returns `Address::ZERO` so `unlog_field_relaxed`,
+/// `record_mature_evac_remset`, and `store` are all skipped.
+#[no_mangle]
+pub extern "C" fn mmtk_object_reference_write_pre_nonheap(
+    _mutator: *mut Mutator<JuliaVM>,
+    _src: ObjectReference,
+    old_val: Address,
+    new_val: Address,
+) {
+    // Push old value to RC decrements.
+    if !old_val.is_zero() {
+        let old_obj = unsafe { ObjectReference::from_raw_address_unchecked(old_val) };
+        DEC_BUFFER.with(|buf| {
+            let mut buf = buf.borrow_mut();
+            buf.push(old_obj);
+            if buf.len() >= DEC_BUFFER_CAPACITY {
+                use mmtk::plan::lxr::rc::ProcessDecs;
+                use mmtk::LazySweepingJobsCounter;
+                let decs = std::mem::replace(&mut *buf, Vec::with_capacity(DEC_BUFFER_CAPACITY));
+                let counter = LazySweepingJobsCounter::new_decs();
+                let work = ProcessDecs::<JuliaVM>::new(decs, counter);
+                SINGLETON.scheduler.postpone_prioritized(work);
+            }
+        });
+    }
+
+    // Push Direct(new_val) to non-heap inc buffer.
+    // At GC time, ProcessIncs loads the Direct slot (returns the captured
+    // object reference without a memory read) and increments its RC.
+    if !new_val.is_zero() {
+        let new_obj = unsafe { ObjectReference::from_raw_address_unchecked(new_val) };
+        NONHEAP_INC_BUFFER.with(|buf| {
+            let mut buf = buf.borrow_mut();
+            buf.push(crate::slots::JuliaVMSlot::Direct(new_obj));
+            if buf.len() >= NONHEAP_INC_CAPACITY {
+                flush_nonheap_inc_buffer(&mut buf);
+            }
+        });
+    }
 }
 
 /// LXR write barrier pre-write (for field-logging barrier).
@@ -651,6 +763,35 @@ pub extern "C" fn mmtk_object_reference_write_pre(
         src,
         crate::slots::JuliaVMSlot::Simple(mmtk::vm::slot::SimpleSlot::from_address(slot)),
         target.into(),
+    );
+}
+
+/// LXR post-cmpswap write barrier with explicit old value.
+///
+/// Called AFTER a successful atomic compare-and-swap on a pointer field.
+/// Unlike `mmtk_object_reference_write_pre`, this does NOT read the old
+/// value from the slot (which now contains the new value).  Instead, the
+/// caller provides the old value explicitly from the cmpswap's `expected`
+/// parameter (unchanged on success per C11 semantics).
+///
+/// This is the correct barrier for cmpswap patterns under LXR.  A pre-write
+/// barrier fired BEFORE a cmpswap that FAILS would spuriously decrement the
+/// current value's RC on each retry iteration → premature free.
+#[no_mangle]
+pub extern "C" fn mmtk_object_reference_write_post_cmpswap(
+    mutator: *mut Mutator<JuliaVM>,
+    src: ObjectReference,
+    slot: Address,
+    old_val: Address,
+    new_val: Address,
+) {
+    let mutator = unsafe { &mut *mutator };
+    use mmtk::MutatorContext;
+    mutator.barrier().object_reference_write_post_cmpswap(
+        src,
+        crate::slots::JuliaVMSlot::Simple(mmtk::vm::slot::SimpleSlot::from_address(slot)),
+        ObjectReference::from_raw_address(old_val),
+        ObjectReference::from_raw_address(new_val),
     );
 }
 
