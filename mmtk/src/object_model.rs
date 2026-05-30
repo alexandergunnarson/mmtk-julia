@@ -136,9 +136,11 @@ impl ObjectModel<JuliaVM> for VMObjectModel {
     }
 
     fn get_current_size(object: ObjectReference) -> usize {
-        // not being called by objects in LOS
-        debug_assert!(!is_object_in_los(&object));
-
+        // Large pointer-bearing GenericMemory buffers are allocated inline
+        // (how==0) in LOS so their slots carry RC/unlog side metadata (the LXR
+        // invariant fix — see plan-alloc.md).  LXR's nursery-scan/promotion
+        // path calls get_size() on such LOS objects, so this is legitimately
+        // reached for LOS objects now; get_so_object_size handles them.
         unsafe { get_so_object_size(object) }
     }
 
@@ -318,7 +320,14 @@ pub unsafe fn get_so_object_size(object: ObjectReference) -> usize {
             llt_align(dtsz + JULIA_HEADER_SIZE, 16)
         };
 
-        debug_assert!(res <= 2032, "size {} greater than minimum!", res);
+        // Inline (how==0) pointer-bearing buffers may exceed the Immix size
+        // class and live in LOS (see plan-alloc.md); the <=2032 bound only
+        // applies to small-object-space residents.
+        debug_assert!(
+            res <= 2032 || is_object_in_los(&object),
+            "size {} greater than minimum!",
+            res
+        );
 
         return res;
     }

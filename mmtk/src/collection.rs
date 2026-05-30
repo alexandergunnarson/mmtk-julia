@@ -98,6 +98,12 @@ impl Collection<JuliaVM> for VMCollection {
     fn block_for_gc(_tls: VMMutatorThread) {
         info!("Triggered GC!");
 
+        // NOTE: All barrier inc/dec buffers now live inside the Mutator's
+        // LXRFieldBarrierSemantics (not in thread_local! storage).  They are
+        // flushed by Mutator::flush() which is called on EVERY mutator
+        // thread in StopMutators::do_work.  No manual flush is needed here.
+        // See HANDOFF Pitfall #58 for history.
+
         unsafe { jl_gc_prepare_to_collect() };
 
         info!("Finished blocking mutator for GC!");

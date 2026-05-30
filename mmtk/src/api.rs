@@ -18,47 +18,24 @@ use std::ffi::CStr;
 use std::sync::atomic::AtomicIsize;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-// Thread-local dec buffer for LXR RC decrements.
-// Used by jl_gc_mmtk_dec_buf_add and jl_gc_mmtk_dec_buf_flush.
-const DEC_BUFFER_CAPACITY: usize = 4096;
-thread_local! {
-    static DEC_BUFFER: std::cell::RefCell<Vec<ObjectReference>> =
-        std::cell::RefCell::new(Vec::with_capacity(DEC_BUFFER_CAPACITY));
-}
-
-// Thread-local inc buffer for non-heap slot barriers (LXR).
-// Accumulates JuliaVMSlot::Direct(new_value) entries from non-heap slot
-// writes.  Flushed as ProcessIncs work packets during jl_gc_mmtk_dec_buf_flush
-// (at GC safepoints).  This avoids going through enqueue_node's non-heap path
-// which would push the slot to both decs AND incs — causing the new value's
-// dec and inc to cancel out (net RC change = 0, wrong).  Instead, the old
-// value is pushed separately to DEC_BUFFER via the same function, and the
-// Direct(new_value) here ensures exactly +1 RC for the new value.
-const NONHEAP_INC_CAPACITY: usize = 4096;
-thread_local! {
-    static NONHEAP_INC_BUFFER: std::cell::RefCell<Vec<crate::slots::JuliaVMSlot>> =
-        std::cell::RefCell::new(Vec::with_capacity(NONHEAP_INC_CAPACITY));
-}
-
-fn flush_nonheap_inc_buffer(buf: &mut Vec<crate::slots::JuliaVMSlot>) {
-    if buf.is_empty() {
-        return;
-    }
-    use mmtk::plan::lxr::rc::{ProcessIncs, EDGE_KIND_MATURE};
-    use mmtk::plan::lxr::LXR;
-    use mmtk::scheduler::WorkBucketStage;
-    let incs = std::mem::replace(buf, Vec::with_capacity(NONHEAP_INC_CAPACITY));
-    let lxr: &'static LXR<JuliaVM> = SINGLETON.get_plan().downcast_ref().unwrap();
-    let work = ProcessIncs::<JuliaVM, { EDGE_KIND_MATURE }>::new(incs, lxr);
-    // Schedule to RCProcessIncs bucket — the same bucket used by the regular
-    // barrier's flush_incs().  ProcessIncs::do_work requires current_pause()
-    // to be set, which is only true during a GC pause.  The RCProcessIncs
-    // bucket is opened during every GC pause, so the work will be processed
-    // at the correct time.  Using postpone_prioritized was wrong because that
-    // path moves work to STWRCDecsAndSweep (which may be disabled for
-    // non-Full pauses under LAZY_DECREMENTS), and the work could end up
-    // running outside a pause context where current_pause() returns None.
-    SINGLETON.scheduler.work_buckets[WorkBucketStage::RCProcessIncs].add(work);
+// Helper: downcast the mutator's barrier to access LXR field barrier
+// semantics (inc/dec queues).  Used by non-heap write barrier and explicit
+// RC dec FFI functions to push entries through the mutator's own queues
+// instead of thread-local buffers.  The mutator's queues are flushed by
+// Mutator::flush() during STW (called on every mutator thread), which is
+// the architecturally correct flush point.
+#[inline]
+fn get_lxr_semantics(
+    mutator: &mut Mutator<JuliaVM>,
+) -> &mut mmtk::plan::lxr::barrier::LXRFieldBarrierSemantics<JuliaVM> {
+    use mmtk::plan::barriers::FieldBarrier;
+    use mmtk::plan::lxr::barrier::LXRFieldBarrierSemantics;
+    use mmtk::MutatorContext;
+    let barrier: &mut dyn mmtk::plan::barriers::Barrier<JuliaVM> = mutator.barrier();
+    let field_barrier: &mut FieldBarrier<LXRFieldBarrierSemantics<JuliaVM>> = barrier
+        .downcast_mut()
+        .expect("LXR plan must use FieldBarrier<LXRFieldBarrierSemantics>");
+    &mut field_barrier.semantics
 }
 
 #[no_mangle]
@@ -168,6 +145,13 @@ pub extern "C" fn mmtk_gc_init(
         MMTK_HEAP_START.store(start, Ordering::Relaxed);
         // 3 contiguous spaces: Immix + Immortal + LOS
         MMTK_HEAP_END.store(start + 3 * extent, Ordering::Relaxed);
+        #[cfg(feature = "lxr_rc_trace")]
+        eprintln!(
+            "[rc-trace heap-range] MMTK_HEAP_START={:#x} MMTK_HEAP_END={:#x} extent={:#x}",
+            start,
+            start + 3 * extent,
+            extent,
+        );
     }
 
     // Initialize GC timing infrastructure.  The LXR fork's Timer uses
@@ -176,6 +160,21 @@ pub extern "C" fn mmtk_gc_init(
     // first during a user-triggered GC.gc().
     mmtk::GC_TRIGGER_TIME.start();
     mmtk::GC_START_TIME.start();
+
+    // Initialize per-object RC tracing from MMTK_RC_TRACE_ADDRS env var.
+    // This must happen after MMTk is initialized (so the trace statics exist)
+    // but before any GC work starts.  The env var format is comma-separated
+    // hex addresses, e.g. "0x200ffc01000,0x200ffc02000".
+    // Build with --features lxr_rc_trace to enable.
+    #[cfg(feature = "lxr_rc_trace")]
+    mmtk::plan::lxr::rc::rc_trace_init_from_env();
+
+    // Initialize the death-time genuine-undercount detector (§2.17) from
+    // MMTK_RC_UNDERCOUNT_BUDGET / MMTK_RC_UNDERCOUNT_FROM_GC.  When enabled, it
+    // reports any freed object that still has a LIVE heap referrer (the genuine
+    // RC undercount), excluding the proven-benign matches=0 deaths (§2.16).
+    #[cfg(feature = "lxr_rc_trace")]
+    mmtk::plan::lxr::rc::rc_undercount_init_from_env();
 
     // Hijack the panic hook to make sure that if we crash in the GC threads, the process aborts.
     crate::set_panic_hook();
@@ -641,45 +640,28 @@ pub extern "C" fn get_mmtk_version() -> *const c_char {
 ///
 /// Under non-LXR plans, this is a no-op since tracing GCs don't use RC.
 #[no_mangle]
-pub extern "C" fn jl_gc_mmtk_dec_buf_add(_mutator: *mut Mutator<JuliaVM>, obj: ObjectReference) {
-    use mmtk::plan::lxr::rc::ProcessDecs;
-    use mmtk::LazySweepingJobsCounter;
-
-    DEC_BUFFER.with(|buf| {
-        let mut buf = buf.borrow_mut();
-        buf.push(obj);
-        if buf.len() >= DEC_BUFFER_CAPACITY {
-            let decs = std::mem::replace(&mut *buf, Vec::with_capacity(DEC_BUFFER_CAPACITY));
-            let counter = LazySweepingJobsCounter::new_decs();
-            let work = ProcessDecs::<JuliaVM>::new(decs, counter);
-            // Schedule as lazy (concurrent) decrement processing
-            SINGLETON.scheduler.postpone_prioritized(work);
-        }
-    });
+pub extern "C" fn jl_gc_mmtk_dec_buf_add(mutator: *mut Mutator<JuliaVM>, obj: ObjectReference) {
+    // Push the decrement directly into the mutator's barrier dec queue.
+    // The barrier's dec queue is flushed by Mutator::flush() during STW
+    // (called on every mutator thread in StopMutators::do_work), so all
+    // pending decrements are processed before the GC sweeps.
+    let mutator = unsafe { &mut *mutator };
+    let semantics = get_lxr_semantics(mutator);
+    semantics.push_dec(obj);
 }
 
-/// Flush any remaining dec buffer entries as a ProcessDecs work packet,
-/// and any non-heap inc buffer entries as a ProcessIncs work packet.
-/// Should be called at GC safepoints to ensure all RC operations are processed.
+/// No-op: retained for FFI compatibility.
+///
+/// Prior to Phase 6.16, this flushed thread-local DEC_BUFFER and
+/// NONHEAP_INC_BUFFER.  Those buffers no longer exist — all inc/dec
+/// entries are now pushed directly into the mutator's barrier queues,
+/// which are flushed by Mutator::flush() during STW.  This function
+/// is still declared as an extern in the C runtime (gc-mmtk.c) so it
+/// must exist, but it does nothing.
 #[no_mangle]
 pub extern "C" fn jl_gc_mmtk_dec_buf_flush() {
-    use mmtk::plan::lxr::rc::ProcessDecs;
-    use mmtk::LazySweepingJobsCounter;
-
-    DEC_BUFFER.with(|buf| {
-        let mut buf = buf.borrow_mut();
-        if !buf.is_empty() {
-            let decs = std::mem::replace(&mut *buf, Vec::with_capacity(DEC_BUFFER_CAPACITY));
-            let counter = LazySweepingJobsCounter::new_decs();
-            let work = ProcessDecs::<JuliaVM>::new(decs, counter);
-            SINGLETON.scheduler.postpone_prioritized(work);
-        }
-    });
-
-    NONHEAP_INC_BUFFER.with(|buf| {
-        let mut buf = buf.borrow_mut();
-        flush_nonheap_inc_buffer(&mut buf);
-    });
+    // Intentionally empty.  All barrier buffers are now inside the
+    // Mutator and flushed by Mutator::flush() during STW.
 }
 
 /// LXR write barrier for non-heap slots (e.g., external GenericMemory data).
@@ -710,40 +692,46 @@ pub extern "C" fn jl_gc_mmtk_dec_buf_flush() {
 /// `record_mature_evac_remset`, and `store` are all skipped.
 #[no_mangle]
 pub extern "C" fn mmtk_object_reference_write_pre_nonheap(
-    _mutator: *mut Mutator<JuliaVM>,
-    _src: ObjectReference,
+    mutator: *mut Mutator<JuliaVM>,
+    src: ObjectReference,
     old_val: Address,
     new_val: Address,
 ) {
-    // Push old value to RC decrements.
-    if !old_val.is_zero() {
-        let old_obj = unsafe { ObjectReference::from_raw_address_unchecked(old_val) };
-        DEC_BUFFER.with(|buf| {
-            let mut buf = buf.borrow_mut();
-            buf.push(old_obj);
-            if buf.len() >= DEC_BUFFER_CAPACITY {
-                use mmtk::plan::lxr::rc::ProcessDecs;
-                use mmtk::LazySweepingJobsCounter;
-                let decs = std::mem::replace(&mut *buf, Vec::with_capacity(DEC_BUFFER_CAPACITY));
-                let counter = LazySweepingJobsCounter::new_decs();
-                let work = ProcessDecs::<JuliaVM>::new(decs, counter);
-                SINGLETON.scheduler.postpone_prioritized(work);
-            }
+    // Genuinely non-heap slot write: the slot lives outside the MMTk heap, so
+    // it has no field-unlog side metadata and the field-logging barrier cannot
+    // operate on it.  This path is now reached only for the residual cases that
+    // legitimately keep their data off-heap — e.g. `how == 2` foreign-wrapped
+    // pointer arrays from `jl_ptr_to_genericmemory` (unsafe_wrap).
+    //
+    // Pointer-bearing GenericMemory buffers are NO LONGER off-heap: they are
+    // allocated inline in the MMTk heap (LOS) so their slots carry side
+    // metadata and take the regular in-heap barrier path
+    // (`mmtk_object_reference_write_pre`).  See plan-alloc.md (Phase 1) and the
+    // removed owner-rescan mechanism in mmtk-core (HANDOFF §2.13).
+    //
+    // For any remaining non-heap pointer slot, do the exact −1/+1: push the old
+    // value to decrements and a `Direct(new)` slot to increments via the
+    // mutator's own barrier queues (flushed by Mutator::flush() during STW).
+    // `Direct` captures the value at barrier time, so ProcessIncs does not
+    // re-read the (metadata-less) slot.
+    let _ = src;
+    let mutator = unsafe { &mut *mutator };
+    let semantics = get_lxr_semantics(mutator);
+    let old = if old_val.is_zero() {
+        None
+    } else {
+        Some(unsafe { ObjectReference::from_raw_address_unchecked(old_val) })
+    };
+    if new_val.is_zero() {
+        // No new value to increment; only decrement the old value.
+        if let Some(old) = old {
+            semantics.push_dec(old);
+        }
+    } else {
+        let new_slot = crate::slots::JuliaVMSlot::Direct(unsafe {
+            ObjectReference::from_raw_address_unchecked(new_val)
         });
-    }
-
-    // Push Direct(new_val) to non-heap inc buffer.
-    // At GC time, ProcessIncs loads the Direct slot (returns the captured
-    // object reference without a memory read) and increments its RC.
-    if !new_val.is_zero() {
-        let new_obj = unsafe { ObjectReference::from_raw_address_unchecked(new_val) };
-        NONHEAP_INC_BUFFER.with(|buf| {
-            let mut buf = buf.borrow_mut();
-            buf.push(crate::slots::JuliaVMSlot::Direct(new_obj));
-            if buf.len() >= NONHEAP_INC_CAPACITY {
-                flush_nonheap_inc_buffer(&mut buf);
-            }
-        });
+        semantics.push_nonheap_write(old, new_slot);
     }
 }
 

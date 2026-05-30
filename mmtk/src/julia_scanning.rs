@@ -817,6 +817,177 @@ pub unsafe fn is_julia_val_array(object: ObjectReference) -> bool {
     false
 }
 
+/// Diagnostic-only (feature `lxr_rc_trace`): read the NUL-terminated name string
+/// of a `jl_sym_t`.  The name bytes are stored inline immediately after the
+/// 24-byte symbol header (standard Julia layout).
+#[cfg(feature = "lxr_rc_trace")]
+unsafe fn debug_symbol_name(sym: *mut jl_sym_t) -> String {
+    if sym.is_null() {
+        return "<null-sym>".to_string();
+    }
+    let name_ptr = (sym as *const u8).add(std::mem::size_of::<jl_sym_t>());
+    let mut bytes = Vec::new();
+    let mut i = 0isize;
+    // Bound the read defensively (symbol names are short).
+    while i < 256 {
+        let b = *name_ptr.offset(i);
+        if b == 0 {
+            break;
+        }
+        bytes.push(b);
+        i += 1;
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// Diagnostic-only (feature `lxr_rc_trace`): return true if `object`'s type
+/// tag denotes a valid Julia type.  Mirrors the validity check in
+/// `scan_julia_object`/`get_current_size` (object_model.rs): a small-typeof
+/// tag is always valid; otherwise the tag must point to a `jl_datatype_t`
+/// whose own tag is the DataType small-tag and whose `smalltag()` is 0.  A
+/// `false` result means the object is freed/corrupt (RC undercount).
+#[cfg(feature = "lxr_rc_trace")]
+pub unsafe fn debug_julia_object_tag_is_valid(object: ObjectReference) -> bool {
+    let obj = object.to_raw_address();
+    let mut vtag = mmtk_jl_typetagof(obj);
+    let vtag_usize = vtag.as_usize();
+    // Small-typeof encoded tags are always valid.
+    if vtag_usize < (JL_MAX_TAGS << 4) {
+        return true;
+    }
+    // Direct pointer to a jl_datatype_t: resolve any forwarding, then validate.
+    vtag = resolve_forwarded_datatype_addr(vtag);
+    let tag_addr = vtag.as_usize();
+    if tag_addr < (JL_MAX_TAGS << 4) {
+        return true;
+    }
+    if !vtag.is_mapped() {
+        return false;
+    }
+    let vt = vtag.to_ptr::<jl_datatype_t>();
+    let type_tag = mmtk_jl_typetagof(vtag);
+    type_tag.as_usize() == ((jl_small_typeof_tags_jl_datatype_tag as usize) << 4)
+        && (*vt).smalltag() == 0
+}
+
+/// Diagnostic-only (feature `lxr_rc_trace`): return the object's type name
+/// using ONLY single-word reads (the tag at `-8`, the typename pointer, and
+/// the symbol name bytes).  Does NOT read `(*vt).layout` or any data fields, so
+/// it is safe to call on a candidate object-start during a mid-sweep heap walk
+/// (used by `describe_referrer_owner`).  Returns "" for an invalid tag.
+#[cfg(feature = "lxr_rc_trace")]
+pub unsafe fn debug_julia_object_type_name(object: ObjectReference) -> String {
+    let obj = object.to_raw_address();
+    let mut vtag = mmtk_jl_typetagof(obj);
+    // Small-typeof encoded tag: not a direct DataType pointer; report the tag.
+    if vtag.as_usize() < (JL_MAX_TAGS << 4) {
+        return format!("<smalltag {:#x}>", vtag.as_usize());
+    }
+    vtag = resolve_forwarded_datatype_addr(vtag);
+    if !vtag.is_mapped() {
+        return String::new();
+    }
+    let vt = vtag.to_ptr::<jl_datatype_t>();
+    let type_tag = mmtk_jl_typetagof(vtag);
+    if type_tag.as_usize() != ((jl_small_typeof_tags_jl_datatype_tag as usize) << 4) {
+        return String::new();
+    }
+    let tn = (*vt).name;
+    if tn.is_null() {
+        return "<null-typename>".to_string();
+    }
+    debug_symbol_name((*tn).name)
+}
+
+/// Diagnostic-only (feature `lxr_rc_trace`): describe a Julia object for the
+/// LXR nursery-promotion corruption guard.  Reports the resolved type name and,
+/// for a GenericMemory, the array classification flags (`arrayelem_isboxed`,
+/// `first_ptr`, `npointers`, `arrayelem_isunion`), `how`, `length`, the data
+/// pointer, and a sample of the first few data words — so a misclassified
+/// value array (scanned as a pointer array) can be identified precisely.
+#[cfg(feature = "lxr_rc_trace")]
+pub unsafe fn debug_describe_julia_object(object: ObjectReference) -> String {
+    let obj = object.to_raw_address();
+    let vt = mmtk_jl_typeof_resolving(obj);
+    if vt.is_null() {
+        return format!("<null-vt obj={:#x}>", obj.as_usize());
+    }
+    let tn = (*vt).name;
+    let type_name = if tn.is_null() {
+        "<null-typename>".to_string()
+    } else {
+        debug_symbol_name((*tn).name)
+    };
+    if (*vt).name == jl_genericmemory_typename {
+        let m = obj.to_ptr::<jl_genericmemory_t>();
+        let how = jl_gc_genericmemory_how(obj);
+        let layout = (*vt).layout;
+        // Element type = the Memory type's 2nd type parameter (kind, T, addrspace).
+        let elt_name = {
+            let params = (*vt).parameters;
+            if params.is_null() {
+                "<no-params>".to_string()
+            } else {
+                let svec_len = mmtk_jl_svec_len(Address::from_ptr(params));
+                if svec_len < 2 {
+                    "<svec<2>".to_string()
+                } else {
+                    let data = mmtk_jl_svec_data(Address::from_ptr(params));
+                    let elt = data.shift::<Address>(1).load::<Address>();
+                    if elt.is_zero() {
+                        "<null-elt>".to_string()
+                    } else {
+                        let elt_vt = elt.to_ptr::<jl_datatype_t>();
+                        let elt_tag = mmtk_jl_typetagof(elt);
+                        if elt_tag.as_usize()
+                            == ((jl_small_typeof_tags_jl_datatype_tag as usize) << 4)
+                            && !(*elt_vt).name.is_null()
+                        {
+                            debug_symbol_name((*(*elt_vt).name).name)
+                        } else {
+                            format!("<elt-tag={:#x}>", elt_tag.as_usize())
+                        }
+                    }
+                }
+            }
+        };
+        let (isboxed, isunion, first_ptr, npointers) = if layout.is_null() {
+            (-1i32, -1i32, -1i32, -1i32)
+        } else {
+            (
+                (*layout).flags.arrayelem_isboxed() as i32,
+                (*layout).flags.arrayelem_isunion() as i32,
+                (*layout).first_ptr as i32,
+                (*layout).npointers as i32,
+            )
+        };
+        let length = (*m).length;
+        let dataptr = (*m).ptr as usize;
+        // Sample words around the valid->garbage boundary (elements 155..175)
+        // to expose any embedded object header / overlapping allocation.
+        let mut sample = String::new();
+        let data = Address::from_ptr((*m).ptr);
+        let lo = if length > 175 { 155isize } else { 0 };
+        let hi = std::cmp::min(length as isize, lo + 20);
+        for i in lo..hi {
+            let a = data.shift::<usize>(i);
+            if a.is_mapped() {
+                sample.push_str(&format!(" [{}]={:#x}", i, a.load::<usize>()));
+            } else {
+                sample.push_str(&format!(" [{}]=<unmapped>", i));
+            }
+        }
+        let zeroinit = (*vt).zeroinit() as i32;
+        format!(
+            "GenericMemory{{{}}} vt={:#x} how={} len={} dataptr={:#x} isboxed={} isunion={} first_ptr={} npointers={} zeroinit={} data:[{} ]",
+            elt_name, vt as usize, how, length, dataptr,
+            isboxed, isunion, first_ptr, npointers, zeroinit, sample
+        )
+    } else {
+        format!("{} vt={:#x}", type_name, vt as usize)
+    }
+}
+
 // ====== scan_julia_object_with_type: pre-loaded type pointer ======
 
 /// Scan a Julia object using a pre-loaded type pointer (klass), avoiding the
