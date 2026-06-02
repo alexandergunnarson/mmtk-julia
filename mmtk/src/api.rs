@@ -54,6 +54,9 @@ pub extern "C" fn mmtk_gc_init(
     {
         let mut builder = BUILDER.lock().unwrap();
 
+        // Read all settings from the MMTK_* environment variables.
+        builder.options.read_env_var_settings();
+
         // Set plan
         use mmtk::util::options::PlanSelector;
         let force_plan = if cfg!(feature = "nogc") {
@@ -189,7 +192,10 @@ pub extern "C" fn mmtk_gc_init(
             &SINGLETON,
             AllocationSemantics::Default,
         );
-        assert_eq!(default_allocator, AllocatorSelector::Immix(0));
+        assert!(
+            default_allocator == AllocatorSelector::Immix(0)
+                || default_allocator == AllocatorSelector::BumpPointer(0)
+        );
         let immortal_allocator = memory_manager::get_allocator_mapping::<JuliaVM>(
             &SINGLETON,
             AllocationSemantics::Immortal,
@@ -202,6 +208,11 @@ pub extern "C" fn mmtk_gc_init(
         // If the assertion failed, check MMTK_MIN_ALIGNMENT in julia.h
         assert_eq!(<JuliaVM as mmtk::vm::VMBinding>::MIN_ALIGNMENT, 4);
     }
+
+    // Force pre-initialization of the thread-safe PIPE_LOCK readability probe on the
+    // main mutator thread during boot-time.  This avoids lazy-static races or allocation
+    // panics inside stop-the-world GC threads.
+    crate::julia_scanning::is_address_readable(0);
 }
 
 #[no_mangle]
@@ -330,6 +341,9 @@ pub extern "C" fn mmtk_is_mapped_address(address: Address) -> bool {
 
 #[no_mangle]
 pub extern "C" fn mmtk_handle_user_collection_request(tls: VMMutatorThread, collection: u8) {
+    if *SINGLETON.get_options().ignore_system_gc {
+        return;
+    }
     AtomicIsize::fetch_add(&USER_TRIGGERED_GC, 1, Ordering::SeqCst);
     if AtomicBool::load(&DISABLED_GC, Ordering::SeqCst) {
         AtomicIsize::fetch_add(&USER_TRIGGERED_GC, -1, Ordering::SeqCst);
@@ -532,6 +546,13 @@ pub static MMTK_HEAP_START: AtomicUsize = AtomicUsize::new(0);
 pub static MMTK_HEAP_END: AtomicUsize = AtomicUsize::new(0);
 
 #[no_mangle]
+pub extern "C" fn mmtk_address_is_in_heap(addr: usize) -> bool {
+    let start = MMTK_HEAP_START.load(Ordering::Relaxed);
+    let end = MMTK_HEAP_END.load(Ordering::Relaxed);
+    start != 0 && addr >= start && addr < end
+}
+
+#[no_mangle]
 pub extern "C" fn mmtk_object_is_managed_by_mmtk(addr: usize) -> bool {
     crate::api::mmtk_is_mapped_address(unsafe { Address::from_usize(addr) })
 }
@@ -714,9 +735,28 @@ pub extern "C" fn mmtk_object_reference_write_pre_nonheap(
     // mutator's own barrier queues (flushed by Mutator::flush() during STW).
     // `Direct` captures the value at barrier time, so ProcessIncs does not
     // re-read the (metadata-less) slot.
-    let _ = src;
     let mutator = unsafe { &mut *mutator };
     let semantics = get_lxr_semantics(mutator);
+    {
+        use mmtk::policy::space::Space;
+        use mmtk::vm::ObjectModel;
+        // Fast path: if the parent object is unlogged (mature and not yet logged),
+        // we must run the barrier. If it is already logged (or is in the nursery,
+        // which is always initialized as logged), we can safely skip the barrier.
+        // This completely avoids side-metadata memory loads on the block table.
+        if semantics.lxr.immix_space.in_space(src) {
+            unsafe {
+                let spec =
+                    *<JuliaVM as mmtk::vm::VMBinding>::VMObjectModel::GLOBAL_FIELD_UNLOG_BIT_SPEC
+                        .as_spec()
+                        .extract_side_spec();
+                let unlog_byte: u8 = spec.load(src.to_raw_address());
+                if unlog_byte == mmtk::plan::barriers::LOGGED_VALUE {
+                    return;
+                }
+            }
+        }
+    }
     let old = if old_val.is_zero() {
         None
     } else {
@@ -830,3 +870,11 @@ pub extern "C" fn mmtk_active_barrier() -> *const libc::c_char {
 #[no_mangle]
 pub static MMTK_FIELD_UNLOG_BIT_BASE_ADDRESS: Address =
     mmtk::util::metadata::side_metadata::GLOBAL_SIDE_METADATA_VM_BASE_ADDRESS;
+
+#[no_mangle]
+pub extern "C" fn mmtk_stick_object(object: ObjectReference) {
+    let plan = SINGLETON.get_plan();
+    if let Some(lxr) = plan.downcast_ref::<mmtk::plan::lxr::LXR<JuliaVM>>() {
+        let _ = lxr.rc.stick(object);
+    }
+}

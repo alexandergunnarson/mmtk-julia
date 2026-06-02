@@ -17,6 +17,7 @@ bindgen = "*"
 
 [profile.release]
 lto = true
+debug = true
 
 [dependencies]
 libc = "0.2"

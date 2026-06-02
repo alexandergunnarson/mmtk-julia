@@ -25,6 +25,7 @@ pub enum JuliaVMSlot {
     /// - `record_mature_evac_remset` skips (address_in_defrag → false)
     /// - `store()` is a no-op (no slot to update)
     Direct(ObjectReference),
+    TypeTag(TypeTagSlot),
 }
 
 unsafe impl Send for JuliaVMSlot {}
@@ -35,17 +36,27 @@ impl Slot for JuliaVMSlot {
             JuliaVMSlot::Simple(e) => e.load(),
             JuliaVMSlot::Offset(e) => e.load(),
             JuliaVMSlot::Direct(o) => Some(*o),
+            JuliaVMSlot::TypeTag(e) => e.load(),
         }
     }
 
     fn store(&self, object: ObjectReference) {
         match self {
-            JuliaVMSlot::Simple(e) => e.store(object),
+            JuliaVMSlot::Simple(e) => {
+                unsafe {
+                    crate::julia_scanning::update_array_ptr_or_offset_if_needed(
+                        e.as_address(),
+                        object,
+                    );
+                }
+                e.store(object);
+            }
             JuliaVMSlot::Offset(e) => e.store(object),
             // No-op: the actual non-heap slot is written by C code after
             // the barrier returns.  Direct slots exist only to carry the
             // captured value through the incs queue without re-reading.
             JuliaVMSlot::Direct(_) => {}
+            JuliaVMSlot::TypeTag(e) => e.store(object),
         }
     }
 
@@ -57,6 +68,7 @@ impl Slot for JuliaVMSlot {
             // heap-range-guarded operations (unlog_field_relaxed,
             // address_in_defrag, record_mature_evac_remset) skip cleanly.
             JuliaVMSlot::Direct(_) => Address::ZERO,
+            JuliaVMSlot::TypeTag(e) => e.address,
         }
     }
 
@@ -65,11 +77,17 @@ impl Slot for JuliaVMSlot {
             JuliaVMSlot::Simple(e) => e.as_address(),
             JuliaVMSlot::Offset(e) => e.slot_address(),
             JuliaVMSlot::Direct(_) => Address::ZERO,
+            JuliaVMSlot::TypeTag(e) => e.address,
         }
     }
 
     fn from_address(addr: Address) -> Self {
         JuliaVMSlot::Simple(SimpleSlot::from_address(addr))
+    }
+
+    #[inline(always)]
+    fn is_type_tag(&self) -> bool {
+        matches!(self, JuliaVMSlot::TypeTag(_))
     }
 }
 
@@ -79,7 +97,35 @@ impl std::fmt::Debug for JuliaVMSlot {
             Self::Simple(e) => write!(f, "{}", e.as_address()),
             Self::Offset(e) => write!(f, "{}+{}", e.slot_address(), e.offset),
             Self::Direct(o) => write!(f, "Direct({:?})", o),
+            Self::TypeTag(e) => write!(f, "TypeTag({})", e.address),
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TypeTagSlot {
+    pub address: Address,
+}
+
+impl TypeTagSlot {
+    pub fn load(&self) -> Option<ObjectReference> {
+        let value = unsafe { self.address.load::<Address>() };
+        let value_usize = value.as_usize();
+        if value_usize == 0 {
+            None
+        } else {
+            // Mask out the lower 4 bits (GC/status bits)
+            let type_addr = unsafe { Address::from_usize(value_usize & !0xf) };
+            unsafe { ObjectReference::from_raw_address(type_addr) }
+        }
+    }
+
+    pub fn store(&self, object: ObjectReference) {
+        let old_value = unsafe { self.address.load::<usize>() };
+        // Preserve the lower 4 bits (GC/status bits)
+        let gc_bits = old_value & 0xf;
+        let new_value = object.to_raw_address().as_usize() | gc_bits;
+        unsafe { self.address.store::<usize>(new_value) };
     }
 }
 

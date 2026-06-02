@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
 use crate::{BLOCK_FOR_GC, STW_COND, WORLD_HAS_STOPPED};
 
 pub static GC_START: AtomicU64 = AtomicU64::new(0);
+pub static GC_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
 use std::collections::HashSet;
 use std::sync::RwLock;
@@ -36,6 +37,9 @@ pub(crate) fn is_gc_thread() -> bool {
     let id = std::thread::current().id();
     GC_THREADS.read().unwrap().contains(&id)
 }
+pub fn is_gc_in_progress() -> bool {
+    AtomicBool::load(&GC_IN_PROGRESS, Ordering::Relaxed)
+}
 
 pub struct VMCollection {}
 
@@ -44,6 +48,7 @@ impl Collection<JuliaVM> for VMCollection {
     where
         F: FnMut(&'static mut Mutator<JuliaVM>),
     {
+        AtomicBool::store(&GC_IN_PROGRESS, true, Ordering::SeqCst);
         // Wait for all mutators to stop and all finalizers to run
         while !AtomicBool::load(&WORLD_HAS_STOPPED, Ordering::SeqCst) {
             // Stay here while the world has not stopped
@@ -80,6 +85,7 @@ impl Collection<JuliaVM> for VMCollection {
             )
         }
 
+        AtomicBool::store(&GC_IN_PROGRESS, false, Ordering::SeqCst);
         AtomicBool::store(&BLOCK_FOR_GC, false, Ordering::SeqCst);
         AtomicBool::store(&WORLD_HAS_STOPPED, false, Ordering::SeqCst);
 

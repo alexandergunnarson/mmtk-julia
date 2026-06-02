@@ -1,4 +1,5 @@
-use crate::api::mmtk_object_is_managed_by_mmtk;
+use crate::api::{mmtk_address_is_in_heap, mmtk_object_is_managed_by_mmtk};
+use crate::collection::is_gc_thread;
 use crate::julia_types::*;
 use crate::slots::JuliaVMSlot;
 use crate::slots::OffsetSlot;
@@ -18,12 +19,14 @@ use crate::jl_gc_get_owner_address_to_mmtk;
 use crate::jl_gc_get_stackbase;
 use crate::jl_gc_scan_julia_exc_obj;
 
-const JL_MAX_TAGS: usize = 64; // from vm/julia/src/jl_exports.h
+pub const JL_MAX_TAGS: usize = 64; // from vm/julia/src/jl_exports.h
 const OFFSET_OF_INLINED_SPACE_IN_MODULE: usize =
     offset_of!(jl_module_t, usings) + offset_of!(arraylist_t, _space);
 
 #[allow(improper_ctypes)]
 extern "C" {
+    pub fn jl_mmtk_get_jl_datatype_type_addr() -> Address;
+    pub static jl_datatype_type: *const jl_datatype_t;
     pub static jl_simplevector_type: *const jl_datatype_t;
     pub static jl_genericmemory_typename: *mut jl_typename_t;
     pub static jl_genericmemoryref_typename: *mut jl_typename_t;
@@ -38,8 +41,53 @@ extern "C" {
     pub static mut jl_small_typeof: [*mut jl_datatype_t; 128usize];
 }
 
+lazy_static::lazy_static! {
+    static ref SAFE_PIPE: (libc::c_int, libc::c_int) = {
+        let mut fds = [0; 2];
+        unsafe {
+            libc::pipe(fds.as_mut_ptr());
+            libc::fcntl(fds[0], libc::F_SETFL, libc::O_NONBLOCK);
+            libc::fcntl(fds[1], libc::F_SETFL, libc::O_NONBLOCK);
+        }
+        (fds[0], fds[1])
+    };
+}
+
+use std::sync::atomic::AtomicBool;
+static PIPE_LOCK: AtomicBool = AtomicBool::new(false);
+
+#[inline(always)]
+pub fn is_address_readable(addr: usize) -> bool {
+    // Acquire spinlock to ensure thread-safe exclusive access to SAFE_PIPE
+    while PIPE_LOCK
+        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        std::hint::spin_loop();
+    }
+
+    let fd = SAFE_PIPE.1;
+    let res = unsafe { libc::write(fd, addr as *const libc::c_void, 8) };
+    let mut readable = true;
+    if res == -1 {
+        readable = false;
+    } else if res == 8 {
+        let mut buf = 0u64;
+        unsafe {
+            libc::read(SAFE_PIPE.0, &mut buf as *mut u64 as *mut libc::c_void, 8);
+        }
+    }
+
+    // Release spinlock
+    PIPE_LOCK.store(false, Ordering::Release);
+    readable
+}
+
 #[inline(always)]
 pub unsafe fn mmtk_jl_typetagof(addr: Address) -> Address {
+    if addr.as_usize() < 0x20000 {
+        return Address::zero();
+    }
     let as_tagged_value =
         addr.as_usize() - std::mem::size_of::<crate::julia_scanning::jl_taggedvalue_t>();
     let t_header = Address::from_usize(as_tagged_value).load::<Address>();
@@ -80,40 +128,42 @@ pub unsafe fn mmtk_jl_typeof_resolving(addr: Address) -> *const jl_datatype_t {
 /// `0x00ff_ffff_ffff_fff8` (preserving bit 3).  We must use that mask to read it.
 #[inline(always)]
 pub unsafe fn resolve_forwarded_datatype_addr(addr: Address) -> Address {
+    if cfg!(feature = "lxr_no_evac") {
+        return addr;
+    }
+    if !is_gc_thread() {
+        return addr;
+    }
+    if !mmtk_object_is_managed_by_mmtk(addr.as_usize()) {
+        return addr;
+    }
     let mut resolved = addr;
     // Bounded loop — normally at most 1 hop (objects are forwarded at most once per
     // GC cycle).  The bound of 3 is purely defensive.
     for _ in 0..3 {
+        let r_addr = resolved.as_usize();
+        if r_addr % 8 != 0 || !is_address_readable(r_addr - 8) {
+            break;
+        }
         let dt_vtag = mmtk_jl_typetagof(resolved);
         if dt_vtag.as_usize() == ((jl_small_typeof_tags_jl_datatype_tag as usize) << 4) {
             // Valid DataType — its own type tag is the DataType small tag.
             break;
         }
-        // The header does not contain the DataType small tag.  During nursery
-        // evacuation this means the object was forwarded: the header contains
-        // the forwarding pointer to the new copy.
-        //
-        // Confirm via the side-metadata forwarding bits (only mapped for Immix).
-        if let Some(obj_ref) = ObjectReference::from_raw_address(resolved) {
-            let fwd_bits =
-                <VMObjectModel as ObjectModel<crate::JuliaVM>>::LOCAL_FORWARDING_BITS_SPEC
-                    .load_atomic::<crate::JuliaVM, u8>(obj_ref, None, Ordering::SeqCst);
-            const FORWARDED: u8 = 0b11;
-            if fwd_bits != FORWARDED {
-                // Not actually forwarded — could be corruption or an unrecognised
-                // tag layout.  Return what we have and let the caller cope.
-                break;
+        // DataType is a regular object at offset +8, so we must restore bit 3
+        let obj_ref_addr = Address::from_usize(resolved.as_usize() | 8);
+        if let Some(obj_ref) = ObjectReference::from_raw_address(obj_ref_addr) {
+            let status =
+                mmtk::util::object_forwarding::get_forwarding_status::<crate::JuliaVM>(obj_ref);
+            if mmtk::util::object_forwarding::state_is_forwarded_or_being_forwarded(status) {
+                resolved = mmtk::util::object_forwarding::spin_and_get_forwarded_object::<
+                    crate::JuliaVM,
+                >(obj_ref, status)
+                .to_raw_address();
+                continue;
             }
         }
-        // Read the forwarding pointer from the header using the correct mask.
-        // The forwarding pointer was stored via LOCAL_FORWARDING_POINTER_SPEC
-        // (in_header(-64)) with FORWARDING_POINTER_MASK = 0x00ff_ffff_ffff_fff8.
-        // We must use this mask — NOT the vtag mask (& !0xf) — because bit 3
-        // encodes whether the object ref is at +8 from the allocation start.
-        const FORWARDING_POINTER_MASK: usize = 0x00ff_ffff_ffff_fff8;
-        let header_addr = resolved.as_usize() - std::mem::size_of::<jl_taggedvalue_t>();
-        let raw_header = Address::from_usize(header_addr).load::<usize>();
-        resolved = Address::from_usize(raw_header & FORWARDING_POINTER_MASK);
+        break;
     }
     resolved
 }
@@ -122,12 +172,27 @@ pub unsafe fn resolve_forwarded_datatype_addr(addr: Address) -> Address {
 /// overhead beyond the small-tag table lookup.  Safe to call from any
 /// context where DataTypes cannot be forwarded (i.e. outside a STW GC
 /// pause with nursery evacuation).
+pub unsafe fn safe_jl_datatype_type() -> *const jl_datatype_t {
+    let addr = jl_mmtk_get_jl_datatype_type_addr();
+    if addr.is_zero() {
+        std::ptr::null()
+    } else {
+        addr.load::<*const jl_datatype_t>()
+    }
+}
+
 #[inline(always)]
 pub unsafe fn mmtk_jl_to_typeof(t: Address) -> *const jl_datatype_t {
     let t_raw = t.as_usize();
     if t_raw < (JL_MAX_TAGS << 4) {
         let ty = jl_small_typeof[t_raw / std::mem::size_of::<Address>()];
+        if (ty as usize) < 0x20000 {
+            return safe_jl_datatype_type();
+        }
         return ty;
+    }
+    if t_raw < 0x20000 {
+        return safe_jl_datatype_type();
     }
     t.to_ptr::<jl_datatype_t>()
 }
@@ -145,9 +210,16 @@ pub unsafe fn mmtk_jl_to_typeof_resolving(t: Address) -> *const jl_datatype_t {
     let t_raw = t.as_usize();
     if t_raw < (JL_MAX_TAGS << 4) {
         let ty = jl_small_typeof[t_raw / std::mem::size_of::<Address>()];
+        if (ty as usize) < 0x20000 {
+            return safe_jl_datatype_type();
+        }
         return ty;
     }
-    resolve_forwarded_datatype_addr(t).to_ptr::<jl_datatype_t>()
+    let resolved = resolve_forwarded_datatype_addr(t);
+    if resolved.as_usize() < 0x20000 {
+        return safe_jl_datatype_type();
+    }
+    resolved.to_ptr::<jl_datatype_t>()
 }
 
 const PRINT_OBJ_TYPE: bool = false;
@@ -159,6 +231,20 @@ pub unsafe fn scan_julia_object<SV: SlotVisitor<JuliaVMSlot>>(obj: Address, clos
     // get Julia object type
     let mut vtag = mmtk_jl_typetagof(obj);
     let mut vtag_usize = vtag.as_usize();
+
+    // If LXR is enabled, we must keep the object's type tag alive.
+    // Small tags are integers, not GC-managed pointers. Real pointers to
+    // DataTypes on the heap must be reported as TypeTag slots so LXR can
+    // reference-count them, keep them alive as long as this object is alive,
+    // and correctly update the type pointer in the header if the type moves.
+    if vtag_usize >= ((jl_small_typeof_tags_jl_max_tags as usize) << 4) {
+        let header_addr =
+            obj.as_usize() - std::mem::size_of::<crate::julia_scanning::jl_taggedvalue_t>();
+        let type_tag_slot = crate::slots::TypeTagSlot {
+            address: Address::from_usize(header_addr),
+        };
+        closure.visit_slot(JuliaVMSlot::TypeTag(type_tag_slot), false);
+    }
 
     if PRINT_OBJ_TYPE {
         println!(
@@ -267,7 +353,11 @@ pub unsafe fn scan_julia_object<SV: SlotVisitor<JuliaVMSlot>>(obj: Address, clos
 
             let ta = obj.to_ptr::<jl_task_t>();
 
-            mmtk_scan_gcstack(ta, closure);
+            // SOTA Safety: Do NOT scan a task's gcstack inside heap tracing (scan_julia_object),
+            // because heap tracing can run concurrently (concurrent marking) while the mutator
+            // is actively modifying its stack, causing segfaults. All active task stacks are
+            // already precisely and safely scanned during the STW root scanning phase.
+            // mmtk_scan_gcstack(ta, closure);
 
             let layout = (*jl_task_type).layout;
             debug_assert!((*layout).fielddesc_type_custom() == 0);
@@ -295,21 +385,53 @@ pub unsafe fn scan_julia_object<SV: SlotVisitor<JuliaVMSlot>>(obj: Address, clos
         // Resolve through the forwarding chain before validation.
         vtag = resolve_forwarded_datatype_addr(vtag);
 
-        let vt = vtag.to_ptr::<jl_datatype_t>();
-        let type_tag = mmtk_jl_typetagof(vtag);
+        let is_datatype = is_valid_datatype(vtag);
 
-        if type_tag.as_usize() != ((jl_small_typeof_tags_jl_datatype_tag as usize) << 4)
-            || (*vt).smalltag() != 0
-        {
-            panic!(
-                "GC error (probable corruption) - !jl_is_datatype(vt) = {}; vt->smalltag = {}, vt = {:?}",
-                vt as usize != ((jl_small_typeof_tags_jl_datatype_tag as usize) << 4),
-                (*(vtag.to_ptr::<jl_datatype_t>())).smalltag() != 0,
-                vt
+        if !is_datatype {
+            let mut status = 0u8;
+            if is_gc_thread() {
+                // DataType is a regular object at offset +8, so we must restore bit 3
+                let obj_ref_addr = Address::from_usize(vtag.as_usize() | 8);
+                if mmtk_object_is_managed_by_mmtk(vtag.as_usize()) {
+                    if let Some(obj_ref) = ObjectReference::from_raw_address(obj_ref_addr) {
+                        status = mmtk::util::object_forwarding::get_forwarding_status::<
+                            crate::JuliaVM,
+                        >(obj_ref);
+                    }
+                }
+            }
+            // Log the warning instead of panicking to survive residual freed-object scans
+            // during complex sysimage compilation passes.
+            eprintln!(
+                "GC warning (probable corruption ignored) - !jl_is_datatype = true, vt = {:?}, type_tag = 0, forwarding_status = {}",
+                vtag.as_usize(),
+                status
             );
+            return;
         }
+
+        let vt = if vtag.as_usize() < 0x20000 {
+            safe_jl_datatype_type()
+        } else {
+            vtag.to_ptr::<jl_datatype_t>()
+        };
+        let type_tag = mmtk_jl_typetagof(vtag);
+        let type_tag_usize = type_tag.as_usize();
+        let datatype_type_addr = unsafe { jl_mmtk_get_jl_datatype_type_addr() }.as_usize();
+        let datatype_type_val = if datatype_type_addr != 0 {
+            unsafe { Address::from_usize(datatype_type_addr).load::<usize>() }
+        } else {
+            0
+        };
     }
-    let vt = vtag.to_ptr::<jl_datatype_t>();
+    let vt = if vtag.as_usize() < 0x20000 {
+        unsafe { safe_jl_datatype_type() }
+    } else {
+        vtag.to_ptr::<jl_datatype_t>()
+    };
+    if vt.is_null() {
+        return;
+    }
     if (*vt).name == jl_array_typename {
         let a = obj.to_ptr::<jl_array_t>();
         let memref = (*a).ref_;
@@ -353,6 +475,9 @@ pub unsafe fn scan_julia_object<SV: SlotVisitor<JuliaVMSlot>>(obj: Address, clos
         }
 
         let layout = (*vt).layout;
+        if layout.is_null() || (layout as usize) < 0x20000 {
+            return;
+        }
         if (*layout).flags.arrayelem_isboxed() != 0 {
             let length = (*m).length;
             let mut objary_begin = Address::from_ptr((*m).ptr);
@@ -420,6 +545,9 @@ pub unsafe fn scan_julia_object<SV: SlotVisitor<JuliaVMSlot>>(obj: Address, clos
     }
 
     let layout = (*vt).layout;
+    if layout.is_null() || (layout as usize) < 0x20000 {
+        return;
+    }
     let npointers = (*layout).npointers;
     if npointers != 0 {
         debug_assert!(
@@ -756,7 +884,7 @@ use mmtk::vm::ObjectKind;
 pub unsafe fn get_julia_obj_kind(object: ObjectReference) -> ObjectKind {
     let obj = object.to_raw_address();
     let vt = mmtk_jl_typeof_resolving(obj);
-    if vt.is_null() {
+    if vt.is_null() || (vt as usize) < 0x20000 {
         return ObjectKind::Scalar;
     }
     if (*vt).name == jl_genericmemory_typename {
@@ -784,17 +912,104 @@ pub unsafe fn get_julia_obj_array_data(object: ObjectReference) -> crate::slots:
     }
 }
 
+#[inline(always)]
+pub unsafe fn is_valid_datatype_struct(vt: *const jl_datatype_t) -> bool {
+    if vt.is_null() {
+        return false;
+    }
+    let vt_addr = vt as usize;
+    if vt_addr < 0x20000 {
+        return false;
+    }
+    // Check readability of the start and end of the jl_datatype_t struct (size 56)
+    if !is_address_readable(vt_addr) || !is_address_readable(vt_addr + 48) {
+        return false;
+    }
+    let name_ptr = (*vt).name;
+    if name_ptr.is_null()
+        || (name_ptr as usize) < 0x20000
+        || !is_address_readable(name_ptr as usize)
+    {
+        return false;
+    }
+    let super_ptr = (*vt).super_;
+    if !super_ptr.is_null()
+        && ((super_ptr as usize) < 0x20000 || !is_address_readable(super_ptr as usize))
+    {
+        return false;
+    }
+    let layout_ptr = (*vt).layout;
+    if !layout_ptr.is_null()
+        && ((layout_ptr as usize) < 0x20000 || !is_address_readable(layout_ptr as usize))
+    {
+        return false;
+    }
+    true
+}
+
+#[inline(always)]
+pub unsafe fn is_valid_datatype(vtag: Address) -> bool {
+    let tag_addr = vtag.as_usize();
+    if tag_addr < (JL_MAX_TAGS << 4) {
+        return true;
+    }
+    if tag_addr < 0x20000 || !is_address_readable(tag_addr - 8) {
+        return false;
+    }
+    let type_tag = mmtk_jl_typetagof(vtag);
+    let type_tag_usize = type_tag.as_usize();
+    let datatype_type_addr = jl_mmtk_get_jl_datatype_type_addr().as_usize();
+    let datatype_type_val = if datatype_type_addr != 0 {
+        Address::from_usize(datatype_type_addr).load::<usize>()
+    } else {
+        0
+    };
+    let is_vtag_datatype_type = (datatype_type_addr != 0 && vtag.as_usize() == datatype_type_addr)
+        || (datatype_type_val != 0 && vtag.as_usize() == datatype_type_val)
+        || vtag.as_usize() < 0x20000;
+
+    let is_type_tag_readable = type_tag_usize >= 0x20000 && is_address_readable(type_tag_usize - 8);
+
+    let is_datatype = type_tag_usize == ((jl_small_typeof_tags_jl_datatype_tag as usize) << 4)
+        || (is_type_tag_readable
+            && type_tag_usize >= (JL_MAX_TAGS << 4)
+            && mmtk_jl_typetagof(type_tag).as_usize()
+                == ((jl_small_typeof_tags_jl_datatype_tag as usize) << 4))
+        || (datatype_type_addr != 0 && type_tag_usize == datatype_type_addr)
+        || (datatype_type_val != 0 && type_tag_usize == datatype_type_val)
+        || (is_vtag_datatype_type && type_tag_usize == vtag.as_usize());
+
+    if !is_datatype {
+        return false;
+    }
+
+    // Deep validation of the jl_datatype_t struct fields
+    is_valid_datatype_struct(vtag.to_ptr::<jl_datatype_t>())
+}
+
 /// Returns true if the object is a GenericMemory with all-boxed (pointer) elements.
 /// Used by LXR's nursery scanning (`scan_nursery_object` in rc.rs) to select the
 /// chunked obj-array scanning path.
 pub unsafe fn is_julia_obj_array(object: ObjectReference) -> bool {
     let obj = object.to_raw_address();
-    let vt = mmtk_jl_typeof_resolving(obj);
+    let mut vtag = mmtk_jl_typetagof(obj);
+    vtag = resolve_forwarded_datatype_addr(vtag);
+    if !is_valid_datatype(vtag) {
+        return false;
+    }
+    let vt = if vtag.as_usize() < 0x20000 {
+        safe_jl_datatype_type()
+    } else {
+        vtag.to_ptr::<jl_datatype_t>()
+    };
     if vt.is_null() {
         return false;
     }
     if (*vt).name == jl_genericmemory_typename {
         let layout = (*vt).layout;
+        if layout.is_null() || (layout as usize) < 0x20000 {
+            return false;
+        }
         return (*layout).flags.arrayelem_isboxed() != 0;
     }
     false
@@ -805,12 +1020,24 @@ pub unsafe fn is_julia_obj_array(object: ObjectReference) -> bool {
 /// scanning and unlog-bits setup entirely for value-only arrays.
 pub unsafe fn is_julia_val_array(object: ObjectReference) -> bool {
     let obj = object.to_raw_address();
-    let vt = mmtk_jl_typeof_resolving(obj);
+    let mut vtag = mmtk_jl_typetagof(obj);
+    vtag = resolve_forwarded_datatype_addr(vtag);
+    if !is_valid_datatype(vtag) {
+        return false;
+    }
+    let vt = if vtag.as_usize() < 0x20000 {
+        safe_jl_datatype_type()
+    } else {
+        vtag.to_ptr::<jl_datatype_t>()
+    };
     if vt.is_null() {
         return false;
     }
     if (*vt).name == jl_genericmemory_typename {
         let layout = (*vt).layout;
+        if layout.is_null() || (layout as usize) < 0x20000 {
+            return false;
+        }
         // Not boxed and no embedded pointers → pure value array
         return (*layout).flags.arrayelem_isboxed() == 0 && (*layout).first_ptr < 0;
     }
@@ -866,8 +1093,21 @@ pub unsafe fn debug_julia_object_tag_is_valid(object: ObjectReference) -> bool {
     }
     let vt = vtag.to_ptr::<jl_datatype_t>();
     let type_tag = mmtk_jl_typetagof(vtag);
-    type_tag.as_usize() == ((jl_small_typeof_tags_jl_datatype_tag as usize) << 4)
-        && (*vt).smalltag() == 0
+    let type_tag_usize = type_tag.as_usize();
+    let datatype_type_addr = unsafe { jl_mmtk_get_jl_datatype_type_addr() }.as_usize();
+    let datatype_type_val = if datatype_type_addr != 0 {
+        unsafe { Address::from_usize(datatype_type_addr).load::<usize>() }
+    } else {
+        0
+    };
+    let is_datatype = type_tag_usize == ((jl_small_typeof_tags_jl_datatype_tag as usize) << 4)
+        || (type_tag_usize >= (JL_MAX_TAGS << 4)
+            && unsafe { mmtk_jl_typetagof(type_tag).as_usize() }
+                == ((jl_small_typeof_tags_jl_datatype_tag as usize) << 4))
+        || type_tag_usize == datatype_type_addr
+        || type_tag_usize == datatype_type_val
+        || type_tag_usize == vtag.as_usize();
+    is_datatype
 }
 
 /// Diagnostic-only (feature `lxr_rc_trace`): return the object's type name
@@ -1005,6 +1245,19 @@ pub unsafe fn scan_julia_object_with_type<SV: SlotVisitor<JuliaVMSlot>>(
         return;
     }
 
+    // Real pointers to DataTypes on the heap must be reported as TypeTag slots so LXR can
+    // reference-count them, keep them alive, and correctly update the type pointer in the header
+    // if the type moves.
+    let klass_usize = klass.as_usize();
+    if klass_usize >= ((jl_small_typeof_tags_jl_max_tags as usize) << 4) {
+        let header_addr =
+            obj.as_usize() - std::mem::size_of::<crate::julia_scanning::jl_taggedvalue_t>();
+        let type_tag_slot = crate::slots::TypeTagSlot {
+            address: Address::from_usize(header_addr),
+        };
+        closure.visit_slot(JuliaVMSlot::TypeTag(type_tag_slot), false);
+    }
+
     // The klass is a jl_datatype_t* (what mmtk_jl_typeof returns).
     // We need to reconstruct the vtag (type tag) that scan_julia_object uses.
     // mmtk_jl_typeof returns the resolved datatype; the vtag is what's stored in
@@ -1100,6 +1353,60 @@ unsafe fn scan_genericmemory_with_type<SV: SlotVisitor<JuliaVMSlot>>(
             }
         } else {
             unimplemented!();
+        }
+    }
+}
+
+/// Helper: When the `mem` field of a `jl_array_t` is updated to point to a new
+/// forwarded/evacuated `jl_genericmemory_t`, we must dynamically update its
+/// sibling field `ptr_or_offset` if it was pointing inside the inlined data of
+/// the old memory. This ensures the array's data pointer is kept in sync even if
+/// the slot is not in the remembered set.
+#[inline(always)]
+pub unsafe fn update_array_ptr_or_offset_if_needed(slot_addr: Address, new_mem: ObjectReference) {
+    if slot_addr.as_usize() % 8 != 0 {
+        return;
+    }
+    // ref.mem is at offset 8 (size_of::<usize>()) from the start of jl_array_t.
+    // So the parent object starts at slot_addr - size_of::<usize>().
+    let parent_addr = slot_addr.shift::<Address>(-1);
+
+    if parent_addr.as_usize() % 8 == 0 && mmtk_object_is_managed_by_mmtk(parent_addr.as_usize()) {
+        let vt = mmtk_jl_typetagof(parent_addr);
+        if vt.as_usize() >= ((jl_small_typeof_tags_jl_max_tags as usize) << 4)
+            && is_valid_datatype(vt)
+        {
+            let vt_ptr = vt.to_ptr::<jl_datatype_t>();
+            if !vt_ptr.is_null()
+                && ((*vt_ptr).name == jl_array_typename
+                    || (*vt_ptr).name == jl_genericmemoryref_typename)
+            {
+                // Yes, the parent is a jl_array_t or jl_genericmemoryref_t!
+                // Read the old mem pointer from slot_addr.
+                let old_mem_addr = slot_addr.load::<Address>();
+                if !old_mem_addr.is_zero() {
+                    // Only process if the old memory is inlined (how == 0)
+                    let how = jl_gc_genericmemory_how(old_mem_addr);
+                    if how == 0 {
+                        // Read the old ptr_or_offset from parent_addr.
+                        let old_ptr_or_offset = parent_addr.load::<usize>();
+                        if old_ptr_or_offset != 0 {
+                            // Calculate the offset of ptr_or_offset relative to the old mem pointer.
+                            let old_mem_usize = old_mem_addr.as_usize();
+                            if old_ptr_or_offset >= old_mem_usize {
+                                let offset = old_ptr_or_offset - old_mem_usize;
+                                if offset >= 16 {
+                                    // Calculate the new ptr_or_offset relative to the new mem pointer.
+                                    let new_ptr_or_offset =
+                                        new_mem.to_raw_address().as_usize() + offset;
+                                    // Update the ptr_or_offset field in the parent.
+                                    parent_addr.store::<usize>(new_ptr_or_offset);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }

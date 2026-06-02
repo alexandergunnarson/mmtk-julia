@@ -83,7 +83,7 @@ unsafe fn scan_ptls_roots(
         root_slots,
     );
 
-    // Live tasks (not roots themselves — only scan their gcstacks)
+    // Live tasks (roots themselves — report their slots and scan their gcstacks)
     let mut i = 0;
     while i < ptls.gc_tls_common.heap.live_tasks.len {
         let mut task_address = Address::from_ptr(ptls.gc_tls_common.heap.live_tasks.items);
@@ -91,6 +91,7 @@ unsafe fn scan_ptls_roots(
         let task = task_address.load::<*const jl_task_t>();
         if !task.is_null() {
             mmtk_scan_gcstack(task, gcstack_slots);
+            root_slots.push(JuliaVMSlot::Simple(SimpleSlot::from_address(task_address)));
         }
         i += 1;
     }
@@ -147,6 +148,111 @@ unsafe fn scan_ptls_roots(
             root_slots.push(JuliaVMSlot::Simple(SimpleSlot::from_address(bt_slot_addr)));
         }
         i += bt_entry_size;
+    }
+
+    // Conservative C stack scan
+    scan_c_stack_conservatively(ptls, root_slots);
+}
+
+/// Conservatively scan C stacks (thread stacks and task stack buffers)
+/// to keep local JIT/compiler pointers (like JIT-resolved method instances)
+/// alive without requiring precise C-side rooting frames.
+unsafe fn scan_c_stack_conservatively(
+    ptls: &mut crate::julia_types::_jl_tls_states_t,
+    root_slots: &mut Vec<JuliaVMSlot>,
+) {
+    use mmtk::util::Address;
+    use mmtk::util::ObjectReference;
+
+    // 1. Scan the system/thread C stack conservatively (from active stack pointer up to stackbase)
+    let stackbase = ptls.stackbase as usize;
+    if stackbase != 0 {
+        let ub = stackbase;
+        let mut lb = 0usize;
+        let task = ptls.current_task as *const crate::julia_types::_jl_task_t;
+        let stacksize = ptls.stacksize;
+
+        // Try getting the dynamically recorded native stack pointer (SOTA!)
+        let thread_sp = unsafe { crate::jl_gc_get_thread_sp(ptls.tid) };
+        if thread_sp != 0 && thread_sp < ub && thread_sp >= ub.saturating_sub(stacksize) {
+            lb = thread_sp;
+        }
+
+        // Try the precise gcstack head
+        if !task.is_null() && !(*task).gcstack.is_null() {
+            let gcstack_addr = (*task).gcstack as usize;
+            if gcstack_addr < ub && gcstack_addr >= ub.saturating_sub(stacksize) {
+                if lb == 0 {
+                    lb = gcstack_addr;
+                } else {
+                    // Use the lower address (deeper stack depth) for safety!
+                    lb = std::cmp::min(lb, gcstack_addr);
+                }
+            }
+        }
+
+        if lb == 0 || lb >= ub {
+            // Fallback to a very safe small range (4KB) down from stackbase
+            lb = stackbase.saturating_sub(4096);
+        }
+
+        let mut cursor = Address::from_usize(lb);
+        let end = Address::from_usize(ub);
+
+        while cursor < end {
+            let word_val = cursor.load::<usize>();
+            if word_val != 0 {
+                let addr = Address::from_usize(word_val);
+                if let Some(obj_ref) = mmtk::memory_manager::is_mmtk_object(addr) {
+                    let header_addr = addr.as_usize() - 8;
+                    if crate::julia_scanning::is_address_readable(header_addr) {
+                        root_slots.push(JuliaVMSlot::Direct(obj_ref));
+                    }
+                }
+            }
+            cursor = cursor.shift::<usize>(1);
+        }
+    }
+
+    // 2. Scan all live tasks' stack buffers conservatively (if stkbuf is non-null, it is 100% mapped)
+    let mut i = 0;
+    while i < ptls.gc_tls_common.heap.live_tasks.len {
+        let mut task_address = Address::from_ptr(ptls.gc_tls_common.heap.live_tasks.items);
+        task_address = task_address.shift::<Address>(i as isize);
+        let task = task_address.load::<*const crate::julia_types::_jl_task_t>();
+        if !task.is_null() {
+            let stkbuf = (*task).ctx.stkbuf as usize;
+            let bufsz = (*task).ctx.bufsz;
+            if stkbuf != 0 && bufsz != 0 {
+                let is_copy_stack = unsafe { (*task).ctx.copy_stack() != 0 };
+                // For separate stack tasks, the first 32KB is the mmap guard page.
+                // For copy stack tasks, it is a malloc'd buffer.
+                let start = if is_copy_stack {
+                    stkbuf
+                } else {
+                    stkbuf.saturating_add(32768)
+                };
+                if start < stkbuf + bufsz {
+                    let mut cursor = Address::from_usize(start);
+                    let end = Address::from_usize(stkbuf + bufsz);
+
+                    while cursor < end {
+                        let word_val = cursor.load::<usize>();
+                        if word_val != 0 {
+                            let addr = Address::from_usize(word_val);
+                            if let Some(obj_ref) = mmtk::memory_manager::is_mmtk_object(addr) {
+                                let header_addr = addr.as_usize() - 8;
+                                if crate::julia_scanning::is_address_readable(header_addr) {
+                                    root_slots.push(JuliaVMSlot::Direct(obj_ref));
+                                }
+                            }
+                        }
+                        cursor = cursor.shift::<usize>(1);
+                    }
+                }
+            }
+        }
+        i += 1;
     }
 }
 
