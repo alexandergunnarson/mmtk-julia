@@ -148,6 +148,31 @@ pub extern "C" fn mmtk_gc_init(
         MMTK_HEAP_START.store(start, Ordering::Relaxed);
         // 3 contiguous spaces: Immix + Immortal + LOS
         MMTK_HEAP_END.store(start + 3 * extent, Ordering::Relaxed);
+
+        // Map GLOBAL_FIELD_UNLOG_BIT_SPEC across the entire 3 contiguous spaces
+        // so that _mmtk_check_bit is safe to execute on any address inside the heap.
+        unsafe {
+            use mmtk::vm::ObjectModel;
+            let spec =
+                *<JuliaVM as mmtk::vm::VMBinding>::VMObjectModel::GLOBAL_FIELD_UNLOG_BIT_SPEC
+                    .as_spec()
+                    .extract_side_spec();
+            let dummy_context = mmtk::util::metadata::side_metadata::SideMetadataContext {
+                global: vec![spec],
+                local: vec![],
+            };
+            if let Err(e) = dummy_context.try_map_metadata_space(
+                mmtk::util::Address::from_usize(start),
+                3 * extent,
+                "LXRUnlogBitMetadata",
+            ) {
+                eprintln!(
+                    "Warning: failed to mmap unlog metadata space (already mapped?): {:?}",
+                    e
+                );
+            }
+        }
+
         #[cfg(feature = "lxr_rc_trace")]
         eprintln!(
             "[rc-trace heap-range] MMTK_HEAP_START={:#x} MMTK_HEAP_END={:#x} extent={:#x}",
@@ -592,11 +617,10 @@ pub extern "C" fn mmtk_get_obj_size(obj: ObjectReference) -> usize {
 #[cfg(all(feature = "object_pinning", not(feature = "non_moving")))]
 #[no_mangle]
 pub extern "C" fn mmtk_pin_object(object: ObjectReference) -> bool {
-    // We may in the future replace this with a check for the immix space (bound check), which should be much cheaper.
-    if mmtk_object_is_managed_by_mmtk(object.to_raw_address().as_usize()) {
+    if mmtk_address_is_in_heap(object.to_raw_address().as_usize()) {
         memory_manager::pin_object(object)
     } else {
-        debug!("Object is not managed by mmtk - (un)pinning it via this function isn't supported.");
+        debug!("Object is not in MMTk heap - pinning it via this function isn't supported.");
         false
     }
 }
@@ -604,10 +628,10 @@ pub extern "C" fn mmtk_pin_object(object: ObjectReference) -> bool {
 #[cfg(all(feature = "object_pinning", not(feature = "non_moving")))]
 #[no_mangle]
 pub extern "C" fn mmtk_unpin_object(object: ObjectReference) -> bool {
-    if mmtk_object_is_managed_by_mmtk(object.to_raw_address().as_usize()) {
+    if mmtk_address_is_in_heap(object.to_raw_address().as_usize()) {
         memory_manager::unpin_object(object)
     } else {
-        debug!("Object is not managed by mmtk - (un)pinning it via this function isn't supported.");
+        debug!("Object is not in MMTk heap - unpinning it via this function isn't supported.");
         false
     }
 }
@@ -615,10 +639,10 @@ pub extern "C" fn mmtk_unpin_object(object: ObjectReference) -> bool {
 #[cfg(all(feature = "object_pinning", not(feature = "non_moving")))]
 #[no_mangle]
 pub extern "C" fn mmtk_is_pinned(object: ObjectReference) -> bool {
-    if mmtk_object_is_managed_by_mmtk(object.to_raw_address().as_usize()) {
+    if mmtk_address_is_in_heap(object.to_raw_address().as_usize()) {
         memory_manager::is_pinned(object)
     } else {
-        debug!("Object is not managed by mmtk - checking via this function isn't supported.");
+        debug!("Object is not in MMTk heap - checking via this function isn't supported.");
         false
     }
 }
@@ -760,7 +784,12 @@ pub extern "C" fn mmtk_object_reference_write_pre_nonheap(
     let old = if old_val.is_zero() {
         None
     } else {
-        Some(unsafe { ObjectReference::from_raw_address_unchecked(old_val) })
+        let old_ref = unsafe { ObjectReference::from_raw_address_unchecked(old_val) };
+        if unsafe { crate::julia_scanning::is_valid_julia_object(old_ref) } {
+            Some(old_ref)
+        } else {
+            None
+        }
     };
     if new_val.is_zero() {
         // No new value to increment; only decrement the old value.
@@ -768,10 +797,13 @@ pub extern "C" fn mmtk_object_reference_write_pre_nonheap(
             semantics.push_dec(old);
         }
     } else {
-        let new_slot = crate::slots::JuliaVMSlot::Direct(unsafe {
-            ObjectReference::from_raw_address_unchecked(new_val)
-        });
-        semantics.push_nonheap_write(old, new_slot);
+        let new_ref = unsafe { ObjectReference::from_raw_address_unchecked(new_val) };
+        if unsafe { crate::julia_scanning::is_valid_julia_object(new_ref) } {
+            let new_slot = crate::slots::JuliaVMSlot::Direct(new_ref);
+            semantics.push_nonheap_write(old, new_slot);
+        } else if let Some(old) = old {
+            semantics.push_dec(old);
+        }
     }
 }
 
@@ -787,11 +819,15 @@ pub extern "C" fn mmtk_object_reference_write_pre(
 ) {
     let mutator = unsafe { &mut *mutator };
     use mmtk::MutatorContext;
-    mutator.barrier().object_reference_write_pre(
-        src,
-        crate::slots::JuliaVMSlot::Simple(mmtk::vm::slot::SimpleSlot::from_address(slot)),
-        target.into(),
-    );
+    if let Some(target_obj) = Option::<ObjectReference>::from(target) {
+        if unsafe { crate::julia_scanning::is_valid_julia_object(target_obj) } {
+            mutator.barrier().object_reference_write_pre(
+                src,
+                crate::slots::JuliaVMSlot::Simple(mmtk::vm::slot::SimpleSlot::from_address(slot)),
+                target.into(),
+            );
+        }
+    }
 }
 
 /// LXR post-cmpswap write barrier with explicit old value.
@@ -815,12 +851,39 @@ pub extern "C" fn mmtk_object_reference_write_post_cmpswap(
 ) {
     let mutator = unsafe { &mut *mutator };
     use mmtk::MutatorContext;
-    mutator.barrier().object_reference_write_post_cmpswap(
-        src,
-        crate::slots::JuliaVMSlot::Simple(mmtk::vm::slot::SimpleSlot::from_address(slot)),
-        ObjectReference::from_raw_address(old_val),
-        ObjectReference::from_raw_address(new_val),
-    );
+    let old_valid = if old_val.is_zero() {
+        false
+    } else {
+        unsafe {
+            crate::julia_scanning::is_valid_julia_object(
+                ObjectReference::from_raw_address_unchecked(old_val),
+            )
+        }
+    };
+    let new_valid = if new_val.is_zero() {
+        false
+    } else {
+        unsafe {
+            crate::julia_scanning::is_valid_julia_object(
+                ObjectReference::from_raw_address_unchecked(new_val),
+            )
+        }
+    };
+    if new_valid {
+        mutator.barrier().object_reference_write_post_cmpswap(
+            src,
+            crate::slots::JuliaVMSlot::Simple(mmtk::vm::slot::SimpleSlot::from_address(slot)),
+            if old_valid {
+                ObjectReference::from_raw_address(old_val)
+            } else {
+                None
+            },
+            ObjectReference::from_raw_address(new_val),
+        );
+    } else if old_valid {
+        let semantics = get_lxr_semantics(mutator);
+        semantics.push_dec(unsafe { ObjectReference::from_raw_address_unchecked(old_val) });
+    }
 }
 
 /// LXR field-logging write barrier slow path.
@@ -871,10 +934,34 @@ pub extern "C" fn mmtk_active_barrier() -> *const libc::c_char {
 pub static MMTK_FIELD_UNLOG_BIT_BASE_ADDRESS: Address =
     mmtk::util::metadata::side_metadata::GLOBAL_SIDE_METADATA_VM_BASE_ADDRESS;
 
+extern "C" {
+    pub fn jl_gc_register_permobj(v: *mut std::ffi::c_void);
+}
+
 #[no_mangle]
 pub extern "C" fn mmtk_stick_object(object: ObjectReference) {
     let plan = SINGLETON.get_plan();
     if let Some(lxr) = plan.downcast_ref::<mmtk::plan::lxr::LXR<JuliaVM>>() {
         let _ = lxr.rc.stick(object);
+        unsafe {
+            jl_gc_register_permobj(object.to_raw_address().as_usize() as *mut std::ffi::c_void);
+        }
     }
+}
+
+#[no_mangle]
+pub extern "C" fn jl_gc_is_valid_root(addr: *mut std::ffi::c_void) -> bool {
+    if addr.is_null() {
+        return false;
+    }
+    if let Some(obj_ref) = unsafe { ObjectReference::from_raw_address(Address::from_ptr(addr)) } {
+        unsafe { crate::julia_scanning::is_valid_julia_object(obj_ref) }
+    } else {
+        false
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn mmtk_julia_gc_epoch_increment() {
+    crate::julia_scanning::GC_EPOCH.fetch_add(1, Ordering::SeqCst);
 }

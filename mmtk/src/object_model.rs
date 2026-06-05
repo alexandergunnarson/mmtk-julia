@@ -314,33 +314,17 @@ pub unsafe fn get_so_object_size(object: ObjectReference) -> usize {
         let is_datatype = crate::julia_scanning::is_valid_datatype(vtag);
 
         if !is_datatype {
-            let mut status = 0u8;
-            if crate::collection::is_gc_thread() {
-                // DataType is a regular object at offset +8, so we must restore bit 3
-                let obj_ref_addr = Address::from_usize(vtag.as_usize() | 8);
-                if crate::api::mmtk_object_is_managed_by_mmtk(vtag.as_usize()) {
-                    if let Some(obj_ref) = ObjectReference::from_raw_address(obj_ref_addr) {
-                        status = mmtk::util::object_forwarding::get_forwarding_status::<
-                            crate::JuliaVM,
-                        >(obj_ref);
-                    }
-                }
-            }
             // Log the warning instead of panicking to survive residual freed-object scans
             // during complex sysimage compilation passes.
+            #[cfg(feature = "lxr_rc_trace")]
             eprintln!(
-                "GC warning (probable corruption ignored) - !jl_is_datatype = true, vt = {:?}, type_tag = 0, forwarding_status = {}",
-                vtag.as_usize(),
-                status
+                "GC warning (probable corruption ignored) - !jl_is_datatype = true, vt = {:?}, type_tag = 0, forwarding_status = 0",
+                vtag.as_usize()
             );
             return llt_align(JULIA_HEADER_SIZE, 16);
         }
 
-        let vt = if vtag.as_usize() < 0x20000 {
-            unsafe { crate::julia_scanning::safe_jl_datatype_type() }
-        } else {
-            vtag.to_ptr::<jl_datatype_t>()
-        };
+        let vt = unsafe { crate::julia_scanning::resolve_datatype_ptr(vtag) };
         let type_tag = mmtk_jl_typetagof(vtag);
         let type_tag_usize = type_tag.as_usize();
         let datatype_type_addr =
@@ -352,11 +336,7 @@ pub unsafe fn get_so_object_size(object: ObjectReference) -> usize {
         };
     }
 
-    let vt = if vtag.as_usize() < 0x20000 {
-        unsafe { crate::julia_scanning::safe_jl_datatype_type() }
-    } else {
-        vtag.to_ptr::<jl_datatype_t>()
-    };
+    let vt = unsafe { crate::julia_scanning::resolve_datatype_ptr(vtag) };
     if vt.is_null() {
         return llt_align(512, 16);
     }

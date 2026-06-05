@@ -1,3 +1,4 @@
+use crate::julia_scanning::is_address_readable;
 use crate::slots::JuliaVMSlot;
 use crate::SINGLETON;
 use mmtk::memory_manager;
@@ -62,14 +63,18 @@ unsafe fn scan_ptls_roots(
         gcstack_slots: &mut GCStackSlotBuffer,
         root_slots: &mut Vec<JuliaVMSlot>,
     ) {
-        if !task.is_null() {
-            // Scan the task's gcstack — produces actual slot addresses
-            mmtk_scan_gcstack(task, gcstack_slots);
+        if !task.is_null() && (task as usize) >= 0x20000 && is_address_readable(task as usize) {
+            if let Some(obj_ref) = ObjectReference::from_raw_address(Address::from_ptr(task)) {
+                if is_valid_julia_object(obj_ref) {
+                    // Scan the task's gcstack — produces actual slot addresses
+                    mmtk_scan_gcstack(task, gcstack_slots);
 
-            if task_is_root {
-                // Report the C-heap slot holding the task pointer
-                // (e.g., &ptls->root_task) so LXR can RC-increment the task object
-                root_slots.push(JuliaVMSlot::Simple(SimpleSlot::from_address(slot_addr)));
+                    if task_is_root {
+                        // Report the C-heap slot holding the task pointer
+                        // (e.g., &ptls->root_task) so LXR can RC-increment the task object
+                        root_slots.push(JuliaVMSlot::Simple(SimpleSlot::from_address(slot_addr)));
+                    }
+                }
             }
         }
     }
@@ -88,10 +93,17 @@ unsafe fn scan_ptls_roots(
     while i < ptls.gc_tls_common.heap.live_tasks.len {
         let mut task_address = Address::from_ptr(ptls.gc_tls_common.heap.live_tasks.items);
         task_address = task_address.shift::<Address>(i as isize);
-        let task = task_address.load::<*const jl_task_t>();
-        if !task.is_null() {
-            mmtk_scan_gcstack(task, gcstack_slots);
-            root_slots.push(JuliaVMSlot::Simple(SimpleSlot::from_address(task_address)));
+        if is_address_readable(task_address.as_usize()) {
+            let task = task_address.load::<*const jl_task_t>();
+            if !task.is_null() && (task as usize) >= 0x20000 && is_address_readable(task as usize) {
+                if let Some(obj_ref) = ObjectReference::from_raw_address(Address::from_ptr(task)) {
+                    if is_valid_julia_object(obj_ref) {
+                        mmtk_scan_gcstack(task, gcstack_slots);
+                        root_slots
+                            .push(JuliaVMSlot::Simple(SimpleSlot::from_address(task_address)));
+                    }
+                }
+            }
         }
         i += 1;
     }
@@ -204,9 +216,10 @@ unsafe fn scan_c_stack_conservatively(
             if word_val != 0 {
                 let addr = Address::from_usize(word_val);
                 if let Some(obj_ref) = mmtk::memory_manager::is_mmtk_object(addr) {
-                    let header_addr = addr.as_usize() - 8;
-                    if crate::julia_scanning::is_address_readable(header_addr) {
-                        root_slots.push(JuliaVMSlot::Direct(obj_ref));
+                    unsafe {
+                        if crate::julia_scanning::is_valid_julia_object(obj_ref) {
+                            root_slots.push(JuliaVMSlot::Direct(obj_ref));
+                        }
                     }
                 }
             }
@@ -219,35 +232,51 @@ unsafe fn scan_c_stack_conservatively(
     while i < ptls.gc_tls_common.heap.live_tasks.len {
         let mut task_address = Address::from_ptr(ptls.gc_tls_common.heap.live_tasks.items);
         task_address = task_address.shift::<Address>(i as isize);
-        let task = task_address.load::<*const crate::julia_types::_jl_task_t>();
-        if !task.is_null() {
-            let stkbuf = (*task).ctx.stkbuf as usize;
-            let bufsz = (*task).ctx.bufsz;
-            if stkbuf != 0 && bufsz != 0 {
-                let is_copy_stack = unsafe { (*task).ctx.copy_stack() != 0 };
-                // For separate stack tasks, the first 32KB is the mmap guard page.
-                // For copy stack tasks, it is a malloc'd buffer.
-                let start = if is_copy_stack {
-                    stkbuf
-                } else {
-                    stkbuf.saturating_add(32768)
-                };
-                if start < stkbuf + bufsz {
-                    let mut cursor = Address::from_usize(start);
-                    let end = Address::from_usize(stkbuf + bufsz);
+        if is_address_readable(task_address.as_usize()) {
+            let task = task_address.load::<*const crate::julia_types::_jl_task_t>();
+            if !task.is_null() && (task as usize) >= 0x20000 && is_address_readable(task as usize) {
+                if let Some(obj_ref) = ObjectReference::from_raw_address(Address::from_ptr(
+                    task as *mut std::ffi::c_void,
+                )) {
+                    if unsafe { crate::julia_scanning::is_valid_julia_object(obj_ref) } {
+                        let stkbuf = (*task).ctx.stkbuf as usize;
+                        let bufsz = (*task).ctx.bufsz;
+                        if stkbuf != 0 && bufsz != 0 {
+                            let is_copy_stack = unsafe { (*task).ctx.copy_stack() != 0 };
+                            // For separate stack tasks, the first 32KB is the mmap guard page.
+                            // For copy stack tasks, it is a malloc'd buffer.
+                            let start = if is_copy_stack {
+                                stkbuf
+                            } else {
+                                stkbuf.saturating_add(32768)
+                            };
+                            if start < stkbuf + bufsz {
+                                let mut cursor = Address::from_usize(start);
+                                let end = Address::from_usize(stkbuf + bufsz);
 
-                    while cursor < end {
-                        let word_val = cursor.load::<usize>();
-                        if word_val != 0 {
-                            let addr = Address::from_usize(word_val);
-                            if let Some(obj_ref) = mmtk::memory_manager::is_mmtk_object(addr) {
-                                let header_addr = addr.as_usize() - 8;
-                                if crate::julia_scanning::is_address_readable(header_addr) {
-                                    root_slots.push(JuliaVMSlot::Direct(obj_ref));
+                                while cursor < end {
+                                    if is_address_readable(cursor.as_usize()) {
+                                        let word_val = cursor.load::<usize>();
+                                        if word_val != 0 {
+                                            let addr = Address::from_usize(word_val);
+                                            if let Some(obj_ref) =
+                                                mmtk::memory_manager::is_mmtk_object(addr)
+                                            {
+                                                unsafe {
+                                                    if crate::julia_scanning::is_valid_julia_object(
+                                                        obj_ref,
+                                                    ) {
+                                                        root_slots
+                                                            .push(JuliaVMSlot::Direct(obj_ref));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    cursor = cursor.shift::<usize>(1);
                                 }
                             }
                         }
-                        cursor = cursor.shift::<usize>(1);
                     }
                 }
             }

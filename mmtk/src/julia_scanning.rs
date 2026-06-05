@@ -1,10 +1,11 @@
-use crate::api::{mmtk_address_is_in_heap, mmtk_object_is_managed_by_mmtk};
+use crate::api::mmtk_object_is_managed_by_mmtk;
 use crate::collection::is_gc_thread;
 use crate::julia_types::*;
 use crate::slots::JuliaVMSlot;
 use crate::slots::OffsetSlot;
 use crate::JULIA_BUFF_TAG;
 use memoffset::offset_of;
+use mmtk::policy::space::Space;
 use mmtk::util::{Address, ObjectReference};
 use mmtk::vm::slot::SimpleSlot;
 use mmtk::vm::SlotVisitor;
@@ -22,6 +23,27 @@ use crate::jl_gc_scan_julia_exc_obj;
 pub const JL_MAX_TAGS: usize = 64; // from vm/julia/src/jl_exports.h
 const OFFSET_OF_INLINED_SPACE_IN_MODULE: usize =
     offset_of!(jl_module_t, usings) + offset_of!(arraylist_t, _space);
+
+pub static GC_EPOCH: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+    static LOCAL_GC_EPOCH: std::cell::Cell<usize> = std::cell::Cell::new(0);
+    pub static VISITED_ROOTS: std::cell::RefCell<std::collections::HashSet<usize>> = std::cell::RefCell::new(std::collections::HashSet::with_capacity(10000));
+}
+
+#[inline(always)]
+pub fn mmtk_address_is_in_immix_or_los(addr: usize) -> bool {
+    use crate::api::{MMTK_HEAP_END, MMTK_HEAP_START};
+    let start = MMTK_HEAP_START.load(Ordering::Relaxed);
+    let end = MMTK_HEAP_END.load(Ordering::Relaxed);
+    if start == 0 || end == 0 {
+        return false;
+    }
+    let extent = (end - start) / 3;
+    let in_immix = addr >= start && addr < start + extent;
+    let in_los = addr >= start + 2 * extent && addr < end;
+    in_immix || in_los
+}
 
 #[allow(improper_ctypes)]
 extern "C" {
@@ -41,8 +63,8 @@ extern "C" {
     pub static mut jl_small_typeof: [*mut jl_datatype_t; 128usize];
 }
 
-lazy_static::lazy_static! {
-    static ref SAFE_PIPE: (libc::c_int, libc::c_int) = {
+thread_local! {
+    static THREAD_PIPE: (libc::c_int, libc::c_int) = {
         let mut fds = [0; 2];
         unsafe {
             libc::pipe(fds.as_mut_ptr());
@@ -53,34 +75,22 @@ lazy_static::lazy_static! {
     };
 }
 
-use std::sync::atomic::AtomicBool;
-static PIPE_LOCK: AtomicBool = AtomicBool::new(false);
-
 #[inline(always)]
 pub fn is_address_readable(addr: usize) -> bool {
-    // Acquire spinlock to ensure thread-safe exclusive access to SAFE_PIPE
-    while PIPE_LOCK
-        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-        .is_err()
-    {
-        std::hint::spin_loop();
-    }
-
-    let fd = SAFE_PIPE.1;
-    let res = unsafe { libc::write(fd, addr as *const libc::c_void, 8) };
-    let mut readable = true;
-    if res == -1 {
-        readable = false;
-    } else if res == 8 {
-        let mut buf = 0u64;
-        unsafe {
-            libc::read(SAFE_PIPE.0, &mut buf as *mut u64 as *mut libc::c_void, 8);
+    THREAD_PIPE.with(|&pipe| {
+        let fd = pipe.1;
+        let res = unsafe { libc::write(fd, addr as *const libc::c_void, 8) };
+        let mut readable = true;
+        if res == -1 {
+            readable = false;
+        } else if res == 8 {
+            let mut buf = 0u64;
+            unsafe {
+                libc::read(pipe.0, &mut buf as *mut u64 as *mut libc::c_void, 8);
+            }
         }
-    }
-
-    // Release spinlock
-    PIPE_LOCK.store(false, Ordering::Release);
-    readable
+        readable
+    })
 }
 
 #[inline(always)]
@@ -90,10 +100,16 @@ pub unsafe fn mmtk_jl_typetagof(addr: Address) -> Address {
     }
     let as_tagged_value =
         addr.as_usize() - std::mem::size_of::<crate::julia_scanning::jl_taggedvalue_t>();
-    let t_header = Address::from_usize(as_tagged_value).load::<Address>();
-    let t = t_header.as_usize() & !0xf;
-
-    Address::from_usize(t)
+    // Fast path: if the header (addr - 16) resides on the same 4KB page as addr,
+    // it is guaranteed to be mapped and safe to read without any expensive syscalls.
+    let is_same_page = (addr.as_usize() & 4095) >= 16;
+    if is_same_page || is_address_readable(as_tagged_value) {
+        let t_header = Address::from_usize(as_tagged_value).load::<Address>();
+        let t = t_header.as_usize() & !0xf;
+        Address::from_usize(t)
+    } else {
+        Address::zero()
+    }
 }
 
 #[inline(always)]
@@ -128,44 +144,7 @@ pub unsafe fn mmtk_jl_typeof_resolving(addr: Address) -> *const jl_datatype_t {
 /// `0x00ff_ffff_ffff_fff8` (preserving bit 3).  We must use that mask to read it.
 #[inline(always)]
 pub unsafe fn resolve_forwarded_datatype_addr(addr: Address) -> Address {
-    if cfg!(feature = "lxr_no_evac") {
-        return addr;
-    }
-    if !is_gc_thread() {
-        return addr;
-    }
-    if !mmtk_object_is_managed_by_mmtk(addr.as_usize()) {
-        return addr;
-    }
-    let mut resolved = addr;
-    // Bounded loop — normally at most 1 hop (objects are forwarded at most once per
-    // GC cycle).  The bound of 3 is purely defensive.
-    for _ in 0..3 {
-        let r_addr = resolved.as_usize();
-        if r_addr % 8 != 0 || !is_address_readable(r_addr - 8) {
-            break;
-        }
-        let dt_vtag = mmtk_jl_typetagof(resolved);
-        if dt_vtag.as_usize() == ((jl_small_typeof_tags_jl_datatype_tag as usize) << 4) {
-            // Valid DataType — its own type tag is the DataType small tag.
-            break;
-        }
-        // DataType is a regular object at offset +8, so we must restore bit 3
-        let obj_ref_addr = Address::from_usize(resolved.as_usize() | 8);
-        if let Some(obj_ref) = ObjectReference::from_raw_address(obj_ref_addr) {
-            let status =
-                mmtk::util::object_forwarding::get_forwarding_status::<crate::JuliaVM>(obj_ref);
-            if mmtk::util::object_forwarding::state_is_forwarded_or_being_forwarded(status) {
-                resolved = mmtk::util::object_forwarding::spin_and_get_forwarded_object::<
-                    crate::JuliaVM,
-                >(obj_ref, status)
-                .to_raw_address();
-                continue;
-            }
-        }
-        break;
-    }
-    resolved
+    addr
 }
 
 /// Fast type-tag resolution (mutator path).  No forwarding check — zero
@@ -179,6 +158,19 @@ pub unsafe fn safe_jl_datatype_type() -> *const jl_datatype_t {
     } else {
         addr.load::<*const jl_datatype_t>()
     }
+}
+
+#[inline(always)]
+pub unsafe fn resolve_datatype_ptr(vtag: Address) -> *const jl_datatype_t {
+    let tag_addr = vtag.as_usize();
+    if tag_addr < 0x20000 {
+        return safe_jl_datatype_type();
+    }
+    let datatype_type_addr = jl_mmtk_get_jl_datatype_type_addr().as_usize();
+    if datatype_type_addr != 0 && tag_addr == datatype_type_addr {
+        return Address::from_usize(datatype_type_addr).load::<*const jl_datatype_t>();
+    }
+    vtag.to_ptr::<jl_datatype_t>()
 }
 
 #[inline(always)]
@@ -224,6 +216,38 @@ pub unsafe fn mmtk_jl_to_typeof_resolving(t: Address) -> *const jl_datatype_t {
 
 const PRINT_OBJ_TYPE: bool = false;
 
+unsafe fn scan_svec_recursively<SV: SlotVisitor<JuliaVMSlot>>(
+    svec: *mut jl_svec_t,
+    closure: &mut SV,
+) {
+    if !svec.is_null() && svec as usize >= 0x20000 && is_address_readable(svec as usize) {
+        let len = mmtk_jl_svec_len(Address::from_ptr(svec));
+        let mut objary_begin = mmtk_jl_svec_data(Address::from_ptr(svec));
+        let objary_end = objary_begin.shift::<Address>(len as isize);
+        while objary_begin < objary_end {
+            process_slot(closure, objary_begin);
+            objary_begin = objary_begin.shift::<Address>(1);
+        }
+    }
+}
+
+unsafe fn scan_array_recursively<SV: SlotVisitor<JuliaVMSlot>>(
+    arr: *mut jl_array_t,
+    closure: &mut SV,
+) {
+    if !arr.is_null() && arr as usize >= 0x20000 && is_address_readable(arr as usize) {
+        let length = (*arr).dimsize.as_slice(1)[0];
+        let mut objary_begin = Address::from_ptr((*arr).ref_.ptr_or_offset);
+        if !objary_begin.is_zero() && is_address_readable(objary_begin.as_usize()) {
+            let objary_end = objary_begin.shift::<Address>(length as isize);
+            while objary_begin < objary_end {
+                process_slot(closure, objary_begin);
+                objary_begin = objary_begin.shift::<Address>(1);
+            }
+        }
+    }
+}
+
 // This function is a rewrite of `gc_mark_outrefs()` in `gc.c`
 // INFO: *_custom() functions are acessors to bitfields that do not use bindgen generated code.
 #[inline(always)]
@@ -256,7 +280,7 @@ pub unsafe fn scan_julia_object<SV: SlotVisitor<JuliaVMSlot>>(obj: Address, clos
 
     // symbols are always marked
     // buffers are marked by their parent object
-    if vtag.to_ptr::<jl_datatype_t>() == jl_symbol_type || vtag_usize == JULIA_BUFF_TAG {
+    if resolve_datatype_ptr(vtag) == jl_symbol_type || vtag_usize == JULIA_BUFF_TAG {
         return;
     }
 
@@ -266,6 +290,44 @@ pub unsafe fn scan_julia_object<SV: SlotVisitor<JuliaVMSlot>>(obj: Address, clos
         || vtag_usize == ((jl_small_typeof_tags_jl_tvar_tag as usize) << 4)
         || vtag_usize == ((jl_small_typeof_tags_jl_vararg_tag as usize) << 4)
     {
+        if vtag_usize == ((jl_small_typeof_tags_jl_datatype_tag as usize) << 4) {
+            let dt = obj.to_ptr::<jl_datatype_t>();
+            let name_ptr = (*dt).name;
+            if !name_ptr.is_null()
+                && (name_ptr as usize) >= 0x20000
+                && mmtk_object_is_managed_by_mmtk(name_ptr as usize)
+                && is_address_readable(name_ptr as usize)
+                && is_address_readable(name_ptr as usize + 80)
+            {
+                let name_tag = mmtk_jl_typetagof(Address::from_ptr(name_ptr)).as_usize();
+                let is_valid_tn = name_tag >= 0x20000
+                    && is_address_readable(name_tag - 8)
+                    && is_valid_datatype(Address::from_usize(name_tag));
+                if is_valid_tn {
+                    let typename_name_slot = ::std::ptr::addr_of!((*name_ptr).name);
+                    process_slot(closure, Address::from_ptr(typename_name_slot));
+
+                    let typename_module_slot = ::std::ptr::addr_of!((*name_ptr).module);
+                    process_slot(closure, Address::from_ptr(typename_module_slot));
+
+                    let typename_wrapper_slot = ::std::ptr::addr_of!((*name_ptr).wrapper);
+                    process_slot(closure, Address::from_ptr(typename_wrapper_slot));
+
+                    let typename_typeofwrapper_slot =
+                        ::std::ptr::addr_of!((*name_ptr).Typeofwrapper);
+                    process_slot(closure, Address::from_ptr(typename_typeofwrapper_slot));
+
+                    // Deeply and recursively scan the elements of the caches and lists (since they are in Immortal space)
+                    scan_svec_recursively((*name_ptr).names as *mut jl_svec_t, closure);
+                    scan_svec_recursively((*name_ptr).cache as usize as *mut jl_svec_t, closure);
+                    scan_svec_recursively(
+                        (*name_ptr).linearcache as usize as *mut jl_svec_t,
+                        closure,
+                    );
+                    scan_array_recursively((*name_ptr).partial as *mut jl_array_t, closure);
+                }
+            }
+        }
         // these objects have pointers in them, but no other special handling
         // so we want these to fall through to the end
         vtag_usize = jl_small_typeof[vtag.as_usize() / std::mem::size_of::<Address>()] as usize;
@@ -388,33 +450,17 @@ pub unsafe fn scan_julia_object<SV: SlotVisitor<JuliaVMSlot>>(obj: Address, clos
         let is_datatype = is_valid_datatype(vtag);
 
         if !is_datatype {
-            let mut status = 0u8;
-            if is_gc_thread() {
-                // DataType is a regular object at offset +8, so we must restore bit 3
-                let obj_ref_addr = Address::from_usize(vtag.as_usize() | 8);
-                if mmtk_object_is_managed_by_mmtk(vtag.as_usize()) {
-                    if let Some(obj_ref) = ObjectReference::from_raw_address(obj_ref_addr) {
-                        status = mmtk::util::object_forwarding::get_forwarding_status::<
-                            crate::JuliaVM,
-                        >(obj_ref);
-                    }
-                }
-            }
             // Log the warning instead of panicking to survive residual freed-object scans
             // during complex sysimage compilation passes.
+            #[cfg(feature = "lxr_rc_trace")]
             eprintln!(
-                "GC warning (probable corruption ignored) - !jl_is_datatype = true, vt = {:?}, type_tag = 0, forwarding_status = {}",
-                vtag.as_usize(),
-                status
+                "GC warning (probable corruption ignored) - !jl_is_datatype = true, vt = {:?}, type_tag = 0, forwarding_status = 0",
+                vtag.as_usize()
             );
             return;
         }
 
-        let vt = if vtag.as_usize() < 0x20000 {
-            safe_jl_datatype_type()
-        } else {
-            vtag.to_ptr::<jl_datatype_t>()
-        };
+        let vt = resolve_datatype_ptr(vtag);
         let type_tag = mmtk_jl_typetagof(vtag);
         let type_tag_usize = type_tag.as_usize();
         let datatype_type_addr = unsafe { jl_mmtk_get_jl_datatype_type_addr() }.as_usize();
@@ -424,22 +470,23 @@ pub unsafe fn scan_julia_object<SV: SlotVisitor<JuliaVMSlot>>(obj: Address, clos
             0
         };
     }
-    let vt = if vtag.as_usize() < 0x20000 {
-        unsafe { safe_jl_datatype_type() }
-    } else {
-        vtag.to_ptr::<jl_datatype_t>()
-    };
+    let vt = resolve_datatype_ptr(vtag);
     if vt.is_null() {
         return;
     }
     if (*vt).name == jl_array_typename {
         let a = obj.to_ptr::<jl_array_t>();
+
+        // Scan the backing GenericMemory pointer at offset 0 of obj!
+        let mem_slot = obj;
+        process_slot(closure, mem_slot);
+
         let memref = (*a).ref_;
 
         let ptr_or_offset = memref.ptr_or_offset;
         // if the object moves its pointer inside the array object (void* ptr_or_offset) needs to be updated as well
         if mmtk_object_is_managed_by_mmtk(ptr_or_offset as usize) {
-            let ptr_or_ref_slot = Address::from_ptr(::std::ptr::addr_of!((*a).ref_.ptr_or_offset));
+            let ptr_or_ref_slot = obj.shift::<Address>(1); // ref_.ptr_or_offset is at offset 8 bytes of obj
             let mem_addr_as_usize = memref.mem as usize;
             let ptr_or_offset_as_usize = ptr_or_offset as usize;
             if ptr_or_offset_as_usize > mem_addr_as_usize {
@@ -630,13 +677,16 @@ pub unsafe fn mmtk_scan_gcstack<EV: SlotVisitor<JuliaVMSlot>>(
         offset = (*ta).ctx.stkbuf as isize - lb as isize;
     }
 
-    if !s.is_null() {
+    if !s.is_null() && is_address_readable(s as usize) {
         let s_nroots_addr = ::std::ptr::addr_of!((*s).nroots);
         let mut nroots = read_stack(Address::from_ptr(s_nroots_addr), offset, lb, ub);
         debug_assert!(nroots.as_usize() as u32 <= u32::MAX);
         let mut nr = nroots >> 2;
 
         loop {
+            if !is_address_readable(s as usize) {
+                break;
+            }
             let rts = Address::from_mut_ptr(s).shift::<Address>(2);
             let mut i = 0;
             while i < nr {
@@ -677,6 +727,9 @@ pub unsafe fn mmtk_scan_gcstack<EV: SlotVisitor<JuliaVMSlot>>(
             }
 
             s = sprev.to_mut_ptr::<jl_gcframe_t>();
+            if !is_address_readable(s as usize) {
+                break;
+            }
             let s_nroots_addr = ::std::ptr::addr_of!((*s).nroots);
             let new_nroots = read_stack(Address::from_ptr(s_nroots_addr), offset, lb, ub);
             nroots = new_nroots;
@@ -698,8 +751,11 @@ pub unsafe fn mmtk_scan_gcstack<EV: SlotVisitor<JuliaVMSlot>>(
 #[inline(always)]
 unsafe fn read_stack(addr: Address, offset: isize, lb: u64, ub: u64) -> Address {
     let real_addr = get_stack_addr(addr, offset, lb, ub);
-
-    real_addr.load::<Address>()
+    if is_address_readable(real_addr.as_usize()) {
+        real_addr.load::<Address>()
+    } else {
+        Address::zero()
+    }
 }
 
 #[inline(always)]
@@ -713,41 +769,74 @@ fn get_stack_addr(addr: Address, offset: isize, lb: u64, ub: u64) -> Address {
 
 #[inline(always)]
 pub fn process_slot<EV: SlotVisitor<JuliaVMSlot>>(closure: &mut EV, slot: Address) {
-    let simple_slot = SimpleSlot::from_address(slot);
+    let objref = match ObjectReference::from_raw_address(slot) {
+        Some(o) => o,
+        None => return,
+    };
 
-    #[cfg(debug_assertions)]
-    {
-        use mmtk::vm::slot::Slot;
+    if !mmtk_address_is_in_immix_or_los(objref.to_raw_address().as_usize()) {
+        let addr = objref.to_raw_address().as_usize();
+        if addr % 8 == 0 && addr >= 0x20000 && mmtk_object_is_managed_by_mmtk(addr) {
+            let global_epoch = GC_EPOCH.load(Ordering::Relaxed);
+            let mut cleared = false;
+            LOCAL_GC_EPOCH.with(|local_epoch| {
+                if local_epoch.get() != global_epoch {
+                    local_epoch.set(global_epoch);
+                    cleared = true;
+                }
+            });
 
-        if PRINT_OBJ_TYPE {
-            println!(
-                "\tprocess slot = {:?} - {:?}\n",
-                simple_slot,
-                simple_slot.load()
-            );
+            let visited = VISITED_ROOTS.with(|visited| {
+                let mut visited = visited.borrow_mut();
+                if cleared {
+                    visited.clear();
+                }
+                !visited.insert(addr)
+            });
+
+            if !visited {
+                unsafe {
+                    scan_julia_object(objref.to_raw_address(), closure);
+                }
+            }
+        }
+    } else {
+        let simple_slot = SimpleSlot::from_address(slot);
+
+        #[cfg(debug_assertions)]
+        {
+            use mmtk::vm::slot::Slot;
+
+            if PRINT_OBJ_TYPE {
+                println!(
+                    "\tprocess slot = {:?} - {:?}\n",
+                    simple_slot,
+                    simple_slot.load()
+                );
+            }
+
+            if let Some(objref) = simple_slot.load() {
+                debug_assert!(
+                    mmtk::memory_manager::is_in_mmtk_spaces(objref),
+                    "Object {:?} in slot {:?} is not mapped address",
+                    objref,
+                    simple_slot
+                );
+
+                let raw_addr_usize = objref.to_raw_address().as_usize();
+
+                // captures wrong slots before creating the work
+                debug_assert!(
+                    raw_addr_usize % 16 == 0 || raw_addr_usize % 8 == 0,
+                    "Object {:?} in slot {:?} is not aligned to 8 or 16",
+                    objref,
+                    simple_slot
+                );
+            }
         }
 
-        if let Some(objref) = simple_slot.load() {
-            debug_assert!(
-                mmtk::memory_manager::is_in_mmtk_spaces(objref),
-                "Object {:?} in slot {:?} is not mapped address",
-                objref,
-                simple_slot
-            );
-
-            let raw_addr_usize = objref.to_raw_address().as_usize();
-
-            // captures wrong slots before creating the work
-            debug_assert!(
-                raw_addr_usize % 16 == 0 || raw_addr_usize % 8 == 0,
-                "Object {:?} in slot {:?} is not aligned to 8 or 16",
-                objref,
-                simple_slot
-            );
-        }
+        closure.visit_slot(JuliaVMSlot::Simple(simple_slot), false);
     }
-
-    closure.visit_slot(JuliaVMSlot::Simple(simple_slot), false);
 }
 
 #[inline(always)]
@@ -756,7 +845,16 @@ pub fn process_offset_slot<EV: SlotVisitor<JuliaVMSlot>>(
     slot: Address,
     offset: usize,
 ) {
+    let objref = match ObjectReference::from_raw_address(slot) {
+        Some(o) => o,
+        None => return,
+    };
+    if !mmtk::memory_manager::is_in_mmtk_spaces(objref) && !is_address_readable(slot.as_usize()) {
+        return;
+    }
+
     let offset_slot = OffsetSlot::new_with_offset(slot, offset);
+
     #[cfg(debug_assertions)]
     {
         use mmtk::vm::slot::Slot;
@@ -883,13 +981,21 @@ use mmtk::vm::ObjectKind;
 /// - Everything else → Scalar
 pub unsafe fn get_julia_obj_kind(object: ObjectReference) -> ObjectKind {
     let obj = object.to_raw_address();
-    let vt = mmtk_jl_typeof_resolving(obj);
-    if vt.is_null() || (vt as usize) < 0x20000 {
+    let mut vtag = mmtk_jl_typetagof(obj);
+    vtag = resolve_forwarded_datatype_addr(vtag);
+    if !is_valid_datatype(vtag) {
+        return ObjectKind::Scalar;
+    }
+    let vt = resolve_datatype_ptr(vtag);
+    if vt.is_null() {
         return ObjectKind::Scalar;
     }
     if (*vt).name == jl_genericmemory_typename {
         let m = obj.to_ptr::<jl_genericmemory_t>();
         let layout = (*vt).layout;
+        if layout.is_null() || (layout as usize) < 0x20000 {
+            return ObjectKind::Scalar;
+        }
         // Boxed elements = array of pointers → ObjArray
         if (*layout).flags.arrayelem_isboxed() != 0 && (*m).length > 0 {
             return ObjectKind::ObjArray((*m).length as u32);
@@ -918,7 +1024,7 @@ pub unsafe fn is_valid_datatype_struct(vt: *const jl_datatype_t) -> bool {
         return false;
     }
     let vt_addr = vt as usize;
-    if vt_addr < 0x20000 {
+    if vt_addr < 0x20000 || vt_addr % 8 != 0 {
         return false;
     }
     // Check readability of the start and end of the jl_datatype_t struct (size 56)
@@ -929,7 +1035,26 @@ pub unsafe fn is_valid_datatype_struct(vt: *const jl_datatype_t) -> bool {
     if name_ptr.is_null()
         || (name_ptr as usize) < 0x20000
         || !is_address_readable(name_ptr as usize)
+        || !is_address_readable(name_ptr as usize + 8)
     {
+        return false;
+    }
+    // Deep validation of (*vt).name as a jl_typename_t:
+    // Name must point to a valid Symbol (tag 0xa0) and module to a valid Module (tag 0x80).
+    let sym_ptr = (*name_ptr).name as usize;
+    let mod_ptr = (*name_ptr).module as usize;
+    if sym_ptr < 0x20000 || mod_ptr < 0x20000 {
+        return false;
+    }
+    if !is_address_readable(sym_ptr - 8) || !is_address_readable(mod_ptr - 8) {
+        return false;
+    }
+    let sym_tag = mmtk_jl_typetagof(Address::from_usize(sym_ptr)).as_usize();
+    let mod_tag = mmtk_jl_typetagof(Address::from_usize(mod_ptr)).as_usize();
+    if sym_tag != ((jl_small_typeof_tags_jl_symbol_tag as usize) << 4) {
+        return false;
+    }
+    if mod_tag != ((jl_small_typeof_tags_jl_module_tag as usize) << 4) {
         return false;
     }
     let super_ptr = (*vt).super_;
@@ -953,7 +1078,7 @@ pub unsafe fn is_valid_datatype(vtag: Address) -> bool {
     if tag_addr < (JL_MAX_TAGS << 4) {
         return true;
     }
-    if tag_addr < 0x20000 || !is_address_readable(tag_addr - 8) {
+    if tag_addr < 0x20000 || tag_addr % 8 != 0 || !is_address_readable(tag_addr - 8) {
         return false;
     }
     let type_tag = mmtk_jl_typetagof(vtag);
@@ -984,7 +1109,7 @@ pub unsafe fn is_valid_datatype(vtag: Address) -> bool {
     }
 
     // Deep validation of the jl_datatype_t struct fields
-    is_valid_datatype_struct(vtag.to_ptr::<jl_datatype_t>())
+    is_valid_datatype_struct(resolve_datatype_ptr(vtag))
 }
 
 /// Returns true if the object is a GenericMemory with all-boxed (pointer) elements.
@@ -997,11 +1122,7 @@ pub unsafe fn is_julia_obj_array(object: ObjectReference) -> bool {
     if !is_valid_datatype(vtag) {
         return false;
     }
-    let vt = if vtag.as_usize() < 0x20000 {
-        safe_jl_datatype_type()
-    } else {
-        vtag.to_ptr::<jl_datatype_t>()
-    };
+    let vt = resolve_datatype_ptr(vtag);
     if vt.is_null() {
         return false;
     }
@@ -1025,11 +1146,7 @@ pub unsafe fn is_julia_val_array(object: ObjectReference) -> bool {
     if !is_valid_datatype(vtag) {
         return false;
     }
-    let vt = if vtag.as_usize() < 0x20000 {
-        safe_jl_datatype_type()
-    } else {
-        vtag.to_ptr::<jl_datatype_t>()
-    };
+    let vt = resolve_datatype_ptr(vtag);
     if vt.is_null() {
         return false;
     }
@@ -1047,6 +1164,41 @@ pub unsafe fn is_julia_val_array(object: ObjectReference) -> bool {
 /// Diagnostic-only (feature `lxr_rc_trace`): read the NUL-terminated name string
 /// of a `jl_sym_t`.  The name bytes are stored inline immediately after the
 /// 24-byte symbol header (standard Julia layout).
+pub unsafe fn is_valid_julia_object(object: ObjectReference) -> bool {
+    let obj = object.to_raw_address();
+    let header_addr = obj.as_usize() - 8;
+    if !is_address_readable(header_addr) || obj.as_usize() % 8 != 0 {
+        return false;
+    }
+    let mut vtag = mmtk_jl_typetagof(obj);
+    let vtag_usize = vtag.as_usize();
+    if vtag_usize == JULIA_BUFF_TAG {
+        return true;
+    }
+    // Small-typeof encoded tags: look up the corresponding DataType and validate it deeply.
+    if vtag_usize != 0 && vtag_usize < (JL_MAX_TAGS << 4) {
+        let idx = vtag_usize / std::mem::size_of::<Address>();
+        if idx >= 128 {
+            return false;
+        }
+        let dt_ptr = jl_small_typeof[idx];
+        if dt_ptr.is_null() {
+            return false;
+        }
+        return is_valid_datatype(Address::from_ptr(dt_ptr));
+    }
+    // Direct pointer to a jl_datatype_t: resolve any forwarding, then validate.
+    vtag = resolve_forwarded_datatype_addr(vtag);
+    let tag_addr = vtag.as_usize();
+    if tag_addr < (JL_MAX_TAGS << 4) {
+        return tag_addr != 0;
+    }
+    if !vtag.is_mapped() {
+        return false;
+    }
+    is_valid_datatype(vtag)
+}
+
 #[cfg(feature = "lxr_rc_trace")]
 unsafe fn debug_symbol_name(sym: *mut jl_sym_t) -> String {
     if sym.is_null() {
@@ -1091,7 +1243,7 @@ pub unsafe fn debug_julia_object_tag_is_valid(object: ObjectReference) -> bool {
     if !vtag.is_mapped() {
         return false;
     }
-    let vt = vtag.to_ptr::<jl_datatype_t>();
+    let vt = resolve_datatype_ptr(vtag);
     let type_tag = mmtk_jl_typetagof(vtag);
     let type_tag_usize = type_tag.as_usize();
     let datatype_type_addr = unsafe { jl_mmtk_get_jl_datatype_type_addr() }.as_usize();
@@ -1102,6 +1254,7 @@ pub unsafe fn debug_julia_object_tag_is_valid(object: ObjectReference) -> bool {
     };
     let is_datatype = type_tag_usize == ((jl_small_typeof_tags_jl_datatype_tag as usize) << 4)
         || (type_tag_usize >= (JL_MAX_TAGS << 4)
+            && type_tag.is_mapped()
             && unsafe { mmtk_jl_typetagof(type_tag).as_usize() }
                 == ((jl_small_typeof_tags_jl_datatype_tag as usize) << 4))
         || type_tag_usize == datatype_type_addr
@@ -1127,7 +1280,7 @@ pub unsafe fn debug_julia_object_type_name(object: ObjectReference) -> String {
     if !vtag.is_mapped() {
         return String::new();
     }
-    let vt = vtag.to_ptr::<jl_datatype_t>();
+    let vt = resolve_datatype_ptr(vtag);
     let type_tag = mmtk_jl_typetagof(vtag);
     if type_tag.as_usize() != ((jl_small_typeof_tags_jl_datatype_tag as usize) << 4) {
         return String::new();
@@ -1153,8 +1306,8 @@ pub unsafe fn debug_describe_julia_object(object: ObjectReference) -> String {
         return format!("<null-vt obj={:#x}>", obj.as_usize());
     }
     let tn = (*vt).name;
-    let type_name = if tn.is_null() {
-        "<null-typename>".to_string()
+    let type_name = if tn.is_null() || !Address::from_ptr(tn).is_mapped() {
+        "<invalid-typename>".to_string()
     } else {
         debug_symbol_name((*tn).name)
     };
