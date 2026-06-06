@@ -125,6 +125,18 @@ pub unsafe fn mmtk_jl_typeof_resolving(addr: Address) -> *const jl_datatype_t {
     mmtk_jl_to_typeof_resolving(mmtk_jl_typetagof(addr))
 }
 
+#[inline(always)]
+pub fn mmtk_address_is_in_immix(addr: usize) -> bool {
+    use crate::api::{MMTK_HEAP_END, MMTK_HEAP_START};
+    let start = MMTK_HEAP_START.load(Ordering::Relaxed);
+    let end = MMTK_HEAP_END.load(Ordering::Relaxed);
+    if start == 0 || end == 0 {
+        return false;
+    }
+    let extent = (end - start) / 3;
+    addr >= start && addr < start + extent
+}
+
 /// If `addr` points to a DataType that has been forwarded during nursery evacuation,
 /// follow the forwarding chain and return the address of the live copy.
 /// Otherwise, returns `addr` unchanged.
@@ -143,8 +155,81 @@ pub unsafe fn mmtk_jl_typeof_resolving(addr: Address) -> *const jl_datatype_t {
 /// reference is ALWAYS set.  The forwarding pointer is stored with mask
 /// `0x00ff_ffff_ffff_fff8` (preserving bit 3).  We must use that mask to read it.
 #[inline(always)]
+pub unsafe fn resolve_forwarded_object_addr(addr: Address) -> Address {
+    if cfg!(feature = "non_moving") {
+        return addr;
+    }
+    if !is_gc_thread() {
+        return addr;
+    }
+    if !mmtk_address_is_in_immix(addr.as_usize()) {
+        return addr;
+    }
+    let mut resolved = addr;
+    let r_addr = resolved.as_usize();
+    if r_addr % 8 == 0 && is_address_readable(r_addr - 8) {
+        // Objects are regular Julia heap allocations at offset +8
+        let obj_ref_addr = Address::from_usize(resolved.as_usize() | 8);
+        if let Some(obj_ref) = ObjectReference::from_raw_address(obj_ref_addr) {
+            let status =
+                mmtk::util::object_forwarding::get_forwarding_status::<crate::JuliaVM>(obj_ref);
+            if mmtk::util::object_forwarding::state_is_forwarded_or_being_forwarded(status) {
+                resolved = mmtk::util::object_forwarding::spin_and_get_forwarded_object::<
+                    crate::JuliaVM,
+                >(obj_ref, status)
+                .to_raw_address();
+            }
+        }
+    }
+    resolved
+}
+
+#[inline(always)]
+pub unsafe fn mmtk_jl_typetagof_resolving(addr: Address) -> Address {
+    let resolved = resolve_forwarded_object_addr(addr);
+    mmtk_jl_typetagof(resolved)
+}
+
+#[inline(always)]
 pub unsafe fn resolve_forwarded_datatype_addr(addr: Address) -> Address {
-    addr
+    if cfg!(feature = "non_moving") {
+        return addr;
+    }
+    if !is_gc_thread() {
+        return addr;
+    }
+    if !mmtk_address_is_in_immix(addr.as_usize()) {
+        return addr;
+    }
+    let mut resolved = addr;
+    // Bounded loop — normally at most 1 hop (objects are forwarded at most once per
+    // GC cycle).  The bound of 3 is purely defensive.
+    for _ in 0..3 {
+        let r_addr = resolved.as_usize();
+        if r_addr % 8 != 0 || !is_address_readable(r_addr - 8) {
+            break;
+        }
+        let dt_vtag = mmtk_jl_typetagof(resolved);
+        if dt_vtag.as_usize() == ((jl_small_typeof_tags_jl_datatype_tag as usize) << 4) {
+            // Valid DataType — its own type tag is the DataType small tag.
+            break;
+        }
+        // DataType is a regular object at offset +8, so we must restore bit 3
+        let obj_ref_addr = Address::from_usize(resolved.as_usize() | 8);
+        if let Some(obj_ref) = ObjectReference::from_raw_address(obj_ref_addr) {
+            let status =
+                mmtk::util::object_forwarding::get_forwarding_status::<crate::JuliaVM>(obj_ref);
+            if mmtk::util::object_forwarding::state_is_forwarded_or_being_forwarded(status) {
+                resolved = mmtk::util::object_forwarding::spin_and_get_forwarded_object::<
+                    crate::JuliaVM,
+                >(obj_ref, status)
+                .to_raw_address();
+                continue;
+            }
+        }
+        break;
+    }
+    resolved
 }
 
 /// Fast type-tag resolution (mutator path).  No forwarding check — zero
@@ -1049,8 +1134,8 @@ pub unsafe fn is_valid_datatype_struct(vt: *const jl_datatype_t) -> bool {
     if !is_address_readable(sym_ptr - 8) || !is_address_readable(mod_ptr - 8) {
         return false;
     }
-    let sym_tag = mmtk_jl_typetagof(Address::from_usize(sym_ptr)).as_usize();
-    let mod_tag = mmtk_jl_typetagof(Address::from_usize(mod_ptr)).as_usize();
+    let sym_tag = mmtk_jl_typetagof_resolving(Address::from_usize(sym_ptr)).as_usize();
+    let mod_tag = mmtk_jl_typetagof_resolving(Address::from_usize(mod_ptr)).as_usize();
     if sym_tag != ((jl_small_typeof_tags_jl_symbol_tag as usize) << 4) {
         return false;
     }
@@ -1064,10 +1149,26 @@ pub unsafe fn is_valid_datatype_struct(vt: *const jl_datatype_t) -> bool {
         return false;
     }
     let layout_ptr = (*vt).layout;
-    if !layout_ptr.is_null()
-        && ((layout_ptr as usize) < 0x20000 || !is_address_readable(layout_ptr as usize))
-    {
-        return false;
+    if !layout_ptr.is_null() {
+        let layout_addr = layout_ptr as usize;
+        if layout_addr < 0x20000 || !is_address_readable(layout_addr) {
+            return false;
+        }
+        let l = layout_ptr;
+        let nfields = (*l).nfields;
+        let npointers = (*l).npointers;
+        let fielddesc_type = (*l).fielddesc_type_custom();
+        let alignment = (*l).alignment;
+        if fielddesc_type > 2
+            || nfields < npointers
+            || (alignment != 1
+                && alignment != 2
+                && alignment != 4
+                && alignment != 8
+                && alignment != 16)
+        {
+            return false;
+        }
     }
     true
 }
@@ -1081,7 +1182,7 @@ pub unsafe fn is_valid_datatype(vtag: Address) -> bool {
     if tag_addr < 0x20000 || tag_addr % 8 != 0 || !is_address_readable(tag_addr - 8) {
         return false;
     }
-    let type_tag = mmtk_jl_typetagof(vtag);
+    let type_tag = mmtk_jl_typetagof_resolving(vtag);
     let type_tag_usize = type_tag.as_usize();
     let datatype_type_addr = jl_mmtk_get_jl_datatype_type_addr().as_usize();
     let datatype_type_val = if datatype_type_addr != 0 {
@@ -1098,7 +1199,7 @@ pub unsafe fn is_valid_datatype(vtag: Address) -> bool {
     let is_datatype = type_tag_usize == ((jl_small_typeof_tags_jl_datatype_tag as usize) << 4)
         || (is_type_tag_readable
             && type_tag_usize >= (JL_MAX_TAGS << 4)
-            && mmtk_jl_typetagof(type_tag).as_usize()
+            && mmtk_jl_typetagof_resolving(type_tag).as_usize()
                 == ((jl_small_typeof_tags_jl_datatype_tag as usize) << 4))
         || (datatype_type_addr != 0 && type_tag_usize == datatype_type_addr)
         || (datatype_type_val != 0 && type_tag_usize == datatype_type_val)
