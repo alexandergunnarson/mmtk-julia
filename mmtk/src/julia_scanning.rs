@@ -7,7 +7,7 @@ use crate::JULIA_BUFF_TAG;
 use memoffset::offset_of;
 use mmtk::policy::space::Space;
 use mmtk::util::{Address, ObjectReference};
-use mmtk::vm::slot::SimpleSlot;
+use mmtk::vm::slot::{SimpleSlot, Slot};
 use mmtk::vm::SlotVisitor;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -24,11 +24,41 @@ pub const JL_MAX_TAGS: usize = 64; // from vm/julia/src/jl_exports.h
 const OFFSET_OF_INLINED_SPACE_IN_MODULE: usize =
     offset_of!(jl_module_t, usings) + offset_of!(arraylist_t, _space);
 
-pub static GC_EPOCH: AtomicUsize = AtomicUsize::new(0);
+pub static GC_EPOCH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+use std::sync::atomic::AtomicBool;
+
+struct VisitedTable {
+    epoch: usize,
+    visited_count: usize,
+    visited_table: Vec<usize>,
+    unmanaged_count: usize,
+    unmanaged_array: Vec<usize>,
+    is_draining: bool,
+}
 
 thread_local! {
-    static LOCAL_GC_EPOCH: std::cell::Cell<usize> = std::cell::Cell::new(0);
-    pub static VISITED_ROOTS: std::cell::RefCell<std::collections::HashSet<usize>> = std::cell::RefCell::new(std::collections::HashSet::with_capacity(10000));
+    static LOCAL_VISITED_PTR: std::cell::Cell<*mut VisitedTable> = std::cell::Cell::new(std::ptr::null_mut());
+}
+
+#[inline(always)]
+fn get_visited_table() -> &'static mut VisitedTable {
+    LOCAL_VISITED_PTR.with(|p| {
+        let mut ptr = p.get();
+        if ptr.is_null() {
+            let table = Box::new(VisitedTable {
+                epoch: 0,
+                visited_count: 0,
+                visited_table: vec![0; 2097152],
+                unmanaged_count: 0,
+                unmanaged_array: vec![0; 1048576],
+                is_draining: false,
+            });
+            ptr = Box::into_raw(table);
+            p.set(ptr);
+        }
+        unsafe { &mut *ptr }
+    })
 }
 
 #[inline(always)]
@@ -100,10 +130,12 @@ pub unsafe fn mmtk_jl_typetagof(addr: Address) -> Address {
     }
     let as_tagged_value =
         addr.as_usize() - std::mem::size_of::<crate::julia_scanning::jl_taggedvalue_t>();
-    // Fast path: if the header (addr - 16) resides on the same 4KB page as addr,
+    // Fast path: if the header resides on the same 4KB page as addr, AND addr is inside MMTk heap,
     // it is guaranteed to be mapped and safe to read without any expensive syscalls.
     let is_same_page = (addr.as_usize() & 4095) >= 16;
-    if is_same_page || is_address_readable(as_tagged_value) {
+    let safe_to_read = (is_same_page && crate::api::mmtk_address_is_in_heap(addr.as_usize()))
+        || is_address_readable(as_tagged_value);
+    if safe_to_read {
         let t_header = Address::from_usize(as_tagged_value).load::<Address>();
         let t = t_header.as_usize() & !0xf;
         Address::from_usize(t)
@@ -305,7 +337,7 @@ unsafe fn scan_svec_recursively<SV: SlotVisitor<JuliaVMSlot>>(
     svec: *mut jl_svec_t,
     closure: &mut SV,
 ) {
-    if !svec.is_null() && svec as usize >= 0x20000 && is_address_readable(svec as usize) {
+    if !svec.is_null() && svec as usize >= 0x20000 {
         let len = mmtk_jl_svec_len(Address::from_ptr(svec));
         let mut objary_begin = mmtk_jl_svec_data(Address::from_ptr(svec));
         let objary_end = objary_begin.shift::<Address>(len as isize);
@@ -320,10 +352,10 @@ unsafe fn scan_array_recursively<SV: SlotVisitor<JuliaVMSlot>>(
     arr: *mut jl_array_t,
     closure: &mut SV,
 ) {
-    if !arr.is_null() && arr as usize >= 0x20000 && is_address_readable(arr as usize) {
+    if !arr.is_null() && arr as usize >= 0x20000 {
         let length = (*arr).dimsize.as_slice(1)[0];
         let mut objary_begin = Address::from_ptr((*arr).ref_.ptr_or_offset);
-        if !objary_begin.is_zero() && is_address_readable(objary_begin.as_usize()) {
+        if !objary_begin.is_zero() {
             let objary_end = objary_begin.shift::<Address>(length as isize);
             while objary_begin < objary_end {
                 process_slot(closure, objary_begin);
@@ -381,13 +413,10 @@ pub unsafe fn scan_julia_object<SV: SlotVisitor<JuliaVMSlot>>(obj: Address, clos
             if !name_ptr.is_null()
                 && (name_ptr as usize) >= 0x20000
                 && mmtk_object_is_managed_by_mmtk(name_ptr as usize)
-                && is_address_readable(name_ptr as usize)
-                && is_address_readable(name_ptr as usize + 80)
             {
                 let name_tag = mmtk_jl_typetagof(Address::from_ptr(name_ptr)).as_usize();
-                let is_valid_tn = name_tag >= 0x20000
-                    && is_address_readable(name_tag - 8)
-                    && is_valid_datatype(Address::from_usize(name_tag));
+                let is_valid_tn =
+                    name_tag >= 0x20000 && is_valid_datatype(Address::from_usize(name_tag));
                 if is_valid_tn {
                     let typename_name_slot = ::std::ptr::addr_of!((*name_ptr).name);
                     process_slot(closure, Address::from_ptr(typename_name_slot));
@@ -854,40 +883,14 @@ fn get_stack_addr(addr: Address, offset: isize, lb: u64, ub: u64) -> Address {
 
 #[inline(always)]
 pub fn process_slot<EV: SlotVisitor<JuliaVMSlot>>(closure: &mut EV, slot: Address) {
-    let objref = match ObjectReference::from_raw_address(slot) {
+    let simple_slot = SimpleSlot::from_address(slot);
+    let target_objref = match simple_slot.load() {
         Some(o) => o,
         None => return,
     };
+    let target_addr = target_objref.to_raw_address().as_usize();
 
-    if !mmtk_address_is_in_immix_or_los(objref.to_raw_address().as_usize()) {
-        let addr = objref.to_raw_address().as_usize();
-        if addr % 8 == 0 && addr >= 0x20000 && mmtk_object_is_managed_by_mmtk(addr) {
-            let global_epoch = GC_EPOCH.load(Ordering::Relaxed);
-            let mut cleared = false;
-            LOCAL_GC_EPOCH.with(|local_epoch| {
-                if local_epoch.get() != global_epoch {
-                    local_epoch.set(global_epoch);
-                    cleared = true;
-                }
-            });
-
-            let visited = VISITED_ROOTS.with(|visited| {
-                let mut visited = visited.borrow_mut();
-                if cleared {
-                    visited.clear();
-                }
-                !visited.insert(addr)
-            });
-
-            if !visited {
-                unsafe {
-                    scan_julia_object(objref.to_raw_address(), closure);
-                }
-            }
-        }
-    } else {
-        let simple_slot = SimpleSlot::from_address(slot);
-
+    if mmtk_address_is_in_immix_or_los(target_addr) {
         #[cfg(debug_assertions)]
         {
             use mmtk::vm::slot::Slot;
@@ -920,7 +923,71 @@ pub fn process_slot<EV: SlotVisitor<JuliaVMSlot>>(closure: &mut EV, slot: Addres
             }
         }
 
-        closure.visit_slot(JuliaVMSlot::Simple(simple_slot), false);
+        if unsafe { is_valid_julia_object(target_objref) } {
+            closure.visit_slot(JuliaVMSlot::Simple(simple_slot), false);
+        }
+    } else {
+        if target_addr % 8 == 0
+            && target_addr >= 0x20000
+            && mmtk_object_is_managed_by_mmtk(target_addr)
+        {
+            let mut visited = false;
+            let global_epoch = GC_EPOCH.load(Ordering::Relaxed);
+            let tbl = get_visited_table();
+
+            if tbl.epoch != global_epoch {
+                tbl.epoch = global_epoch;
+                tbl.visited_table.fill(0);
+                tbl.visited_count = 0;
+                tbl.unmanaged_count = 0;
+            }
+
+            // Multiplicative hash
+            let hash = (target_addr.wrapping_mul(11400714819323198485)) >> 32;
+            let mask = 2097152 - 1; // capacity - 1
+            let mut idx = hash & mask;
+
+            loop {
+                let entry = tbl.visited_table[idx];
+                if entry == 0 {
+                    visited = false;
+                    tbl.visited_table[idx] = target_addr;
+                    if tbl.visited_count >= 2097152 - 1 {
+                        panic!("MMTk-Julia Error: Visited table has exceeded capacity (2097152)!");
+                    }
+                    tbl.visited_count += 1;
+                    break;
+                }
+                if entry == target_addr {
+                    visited = true;
+                    break;
+                }
+                idx = (idx + 1) & mask;
+            }
+
+            if !visited {
+                if tbl.unmanaged_count < 1048576 {
+                    tbl.unmanaged_array[tbl.unmanaged_count] = target_addr;
+                    tbl.unmanaged_count += 1;
+                } else {
+                    panic!(
+                        "MMTk-Julia Error: Unmanaged Work Queue has exceeded capacity (1048576)!"
+                    );
+                }
+            }
+
+            if !visited && !tbl.is_draining {
+                tbl.is_draining = true;
+                while tbl.unmanaged_count > 0 {
+                    tbl.unmanaged_count -= 1;
+                    let next_addr = tbl.unmanaged_array[tbl.unmanaged_count];
+                    unsafe {
+                        scan_julia_object(Address::from_usize(next_addr), closure);
+                    }
+                }
+                tbl.is_draining = false;
+            }
+        }
     }
 }
 
@@ -1116,7 +1183,8 @@ pub unsafe fn is_valid_datatype_struct(vt: *const jl_datatype_t) -> bool {
     if !is_address_readable(vt_addr) || !is_address_readable(vt_addr + 48) {
         return false;
     }
-    let name_ptr = (*vt).name;
+    let name_ptr =
+        resolve_forwarded_object_addr(Address::from_ptr((*vt).name)).to_ptr::<jl_typename_t>();
     if name_ptr.is_null()
         || (name_ptr as usize) < 0x20000
         || !is_address_readable(name_ptr as usize)
@@ -1126,8 +1194,8 @@ pub unsafe fn is_valid_datatype_struct(vt: *const jl_datatype_t) -> bool {
     }
     // Deep validation of (*vt).name as a jl_typename_t:
     // Name must point to a valid Symbol (tag 0xa0) and module to a valid Module (tag 0x80).
-    let sym_ptr = (*name_ptr).name as usize;
-    let mod_ptr = (*name_ptr).module as usize;
+    let sym_ptr = resolve_forwarded_object_addr(Address::from_ptr((*name_ptr).name)).as_usize();
+    let mod_ptr = resolve_forwarded_object_addr(Address::from_ptr((*name_ptr).module)).as_usize();
     if sym_ptr < 0x20000 || mod_ptr < 0x20000 {
         return false;
     }
@@ -1142,13 +1210,15 @@ pub unsafe fn is_valid_datatype_struct(vt: *const jl_datatype_t) -> bool {
     if mod_tag != ((jl_small_typeof_tags_jl_module_tag as usize) << 4) {
         return false;
     }
-    let super_ptr = (*vt).super_;
+    let super_ptr =
+        resolve_forwarded_object_addr(Address::from_ptr((*vt).super_)).to_ptr::<jl_datatype_t>();
     if !super_ptr.is_null()
         && ((super_ptr as usize) < 0x20000 || !is_address_readable(super_ptr as usize))
     {
         return false;
     }
-    let layout_ptr = (*vt).layout;
+    let layout_ptr = resolve_forwarded_object_addr(Address::from_ptr((*vt).layout))
+        .to_ptr::<jl_datatype_layout_t>();
     if !layout_ptr.is_null() {
         let layout_addr = layout_ptr as usize;
         if layout_addr < 0x20000 || !is_address_readable(layout_addr) {
@@ -1175,6 +1245,7 @@ pub unsafe fn is_valid_datatype_struct(vt: *const jl_datatype_t) -> bool {
 
 #[inline(always)]
 pub unsafe fn is_valid_datatype(vtag: Address) -> bool {
+    let vtag = resolve_forwarded_object_addr(vtag);
     let tag_addr = vtag.as_usize();
     if tag_addr < (JL_MAX_TAGS << 4) {
         return true;
@@ -1262,6 +1333,59 @@ pub unsafe fn is_julia_val_array(object: ObjectReference) -> bool {
     false
 }
 
+/// High-performance, zero-overhead validity check for any heap object reference.
+/// Instantly rejects Float32/Int32 garbage values and stale pointers.
+pub unsafe fn is_valid_heap_object_reference(o: ObjectReference) -> bool {
+    let addr = o.to_raw_address().as_usize();
+    if addr % 8 != 0 || addr < 0x20000 {
+        return false;
+    }
+    if !o.to_raw_address().is_mapped() {
+        return false;
+    }
+    if mmtk_address_is_in_immix(addr) {
+        if mmtk::util::object_forwarding::is_forwarded_or_being_forwarded::<crate::JuliaVM>(o) {
+            return true;
+        }
+    }
+    let header_addr = addr - 8;
+    if !is_address_readable(header_addr) {
+        return false;
+    }
+    let vtag = mmtk_jl_typetagof(o.to_raw_address()).as_usize();
+    if vtag == JULIA_BUFF_TAG {
+        if addr % 16 != 0 {
+            return false;
+        }
+        if !is_address_readable(addr) {
+            return false;
+        }
+        let len = o.to_raw_address().load::<usize>();
+        return len <= 100_000_000;
+    }
+    if vtag == 0 {
+        return false;
+    }
+    if vtag < (JL_MAX_TAGS << 4) {
+        let idx = vtag / std::mem::size_of::<Address>();
+        if idx >= 128 {
+            return false;
+        }
+        let dt_ptr = jl_small_typeof[idx];
+        if dt_ptr.is_null() {
+            return false;
+        }
+        return is_valid_datatype(Address::from_ptr(dt_ptr));
+    }
+    if vtag % 8 != 0 || vtag < 0x20000 {
+        return false;
+    }
+    if !is_address_readable(vtag) {
+        return false;
+    }
+    is_valid_datatype(Address::from_usize(vtag))
+}
+
 /// Diagnostic-only (feature `lxr_rc_trace`): read the NUL-terminated name string
 /// of a `jl_sym_t`.  The name bytes are stored inline immediately after the
 /// 24-byte symbol header (standard Julia layout).
@@ -1274,6 +1398,16 @@ pub unsafe fn is_valid_julia_object(object: ObjectReference) -> bool {
     let mut vtag = mmtk_jl_typetagof(obj);
     let vtag_usize = vtag.as_usize();
     if vtag_usize == JULIA_BUFF_TAG {
+        if obj.as_usize() % 16 != 0 {
+            return false;
+        }
+        if !is_address_readable(obj.as_usize()) {
+            return false;
+        }
+        let len = unsafe { obj.load::<usize>() };
+        if len > 100_000_000 {
+            return false;
+        }
         return true;
     }
     // Small-typeof encoded tags: look up the corresponding DataType and validate it deeply.
@@ -1625,7 +1759,10 @@ pub unsafe fn update_array_ptr_or_offset_if_needed(slot_addr: Address, new_mem: 
     // So the parent object starts at slot_addr - size_of::<usize>().
     let parent_addr = slot_addr.shift::<Address>(-1);
 
-    if parent_addr.as_usize() % 8 == 0 && mmtk_object_is_managed_by_mmtk(parent_addr.as_usize()) {
+    if parent_addr.as_usize() % 8 == 0
+        && (mmtk_object_is_managed_by_mmtk(parent_addr.as_usize())
+            || is_address_readable(parent_addr.as_usize()))
+    {
         let vt = mmtk_jl_typetagof(parent_addr);
         if vt.as_usize() >= ((jl_small_typeof_tags_jl_max_tags as usize) << 4)
             && is_valid_datatype(vt)

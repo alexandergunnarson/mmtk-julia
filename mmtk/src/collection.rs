@@ -21,21 +21,26 @@ use std::collections::HashSet;
 use std::sync::RwLock;
 use std::thread::ThreadId;
 
+thread_local! {
+    static IS_GC_THREAD: std::cell::Cell<bool> = std::cell::Cell::new(false);
+}
+
 lazy_static! {
     static ref GC_THREADS: RwLock<HashSet<ThreadId>> = RwLock::new(HashSet::new());
 }
 
 pub(crate) fn register_gc_thread() {
+    IS_GC_THREAD.with(|is_gc| is_gc.set(true));
     let id = std::thread::current().id();
     GC_THREADS.write().unwrap().insert(id);
 }
 pub(crate) fn unregister_gc_thread() {
+    IS_GC_THREAD.with(|is_gc| is_gc.set(false));
     let id = std::thread::current().id();
     GC_THREADS.write().unwrap().remove(&id);
 }
 pub(crate) fn is_gc_thread() -> bool {
-    let id = std::thread::current().id();
-    GC_THREADS.read().unwrap().contains(&id)
+    IS_GC_THREAD.with(|is_gc| is_gc.get())
 }
 pub fn is_gc_in_progress() -> bool {
     AtomicBool::load(&GC_IN_PROGRESS, Ordering::Relaxed)

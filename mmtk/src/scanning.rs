@@ -405,6 +405,10 @@ impl Scanning<JuliaVM> for VMScanning {
         unsafe { crate::julia_scanning::get_julia_obj_array_data(object) }
     }
 
+    fn is_valid_object(object: ObjectReference) -> bool {
+        unsafe { crate::julia_scanning::is_valid_heap_object_reference(object) }
+    }
+
     #[cfg(feature = "lxr_rc_trace")]
     fn debug_describe_object(object: ObjectReference) -> String {
         unsafe { crate::julia_scanning::debug_describe_julia_object(object) }

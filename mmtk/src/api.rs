@@ -614,11 +614,158 @@ pub extern "C" fn mmtk_get_obj_size(obj: ObjectReference) -> usize {
     }
 }
 
+unsafe fn get_object_type_name(object: ObjectReference) -> String {
+    let obj = object.to_raw_address();
+    let mut vtag = crate::julia_scanning::mmtk_jl_typetagof(obj);
+    let max_tags = crate::julia_types::jl_small_typeof_tags_jl_max_tags as usize;
+    if vtag.as_usize() < (max_tags << 4) {
+        let ty = crate::julia_scanning::jl_small_typeof
+            [vtag.as_usize() / std::mem::size_of::<Address>()];
+        if !ty.is_null() && Address::from_ptr(ty).is_mapped() {
+            let tn = (*ty).name;
+            if !tn.is_null() && Address::from_ptr(tn).is_mapped() {
+                let sym = (*tn).name;
+                if !sym.is_null() && Address::from_ptr(sym).is_mapped() {
+                    let name_ptr =
+                        (sym as *const u8).add(std::mem::size_of::<crate::julia_types::jl_sym_t>());
+                    let mut bytes = Vec::new();
+                    let mut p = name_ptr;
+                    for _ in 0..100 {
+                        let b = *p;
+                        if b == 0 {
+                            break;
+                        }
+                        bytes.push(b);
+                        p = p.add(1);
+                    }
+                    if let Ok(s) = String::from_utf8(bytes) {
+                        return s;
+                    }
+                }
+            }
+        }
+        return String::new();
+    }
+    vtag = crate::julia_scanning::resolve_forwarded_datatype_addr(vtag);
+    if !vtag.is_mapped() {
+        return String::new();
+    }
+    let vt = crate::julia_scanning::resolve_datatype_ptr(vtag);
+    let type_tag = crate::julia_scanning::mmtk_jl_typetagof(vtag);
+    let datatype_tag = crate::julia_types::jl_small_typeof_tags_jl_datatype_tag as usize;
+    if type_tag.as_usize() != (datatype_tag << 4) {
+        return String::new();
+    }
+    let tn = (*vt).name;
+    if tn.is_null() || !Address::from_ptr(tn).is_mapped() {
+        return String::new();
+    }
+    let sym = (*tn).name;
+    if sym.is_null() || !Address::from_ptr(sym).is_mapped() {
+        return String::new();
+    }
+    let name_ptr = (sym as *const u8).add(std::mem::size_of::<crate::julia_types::jl_sym_t>());
+    let mut bytes = Vec::new();
+    let mut p = name_ptr;
+    for _ in 0..100 {
+        let b = *p;
+        if b == 0 {
+            break;
+        }
+        bytes.push(b);
+        p = p.add(1);
+    }
+    if let Ok(s) = String::from_utf8(bytes) {
+        s
+    } else {
+        String::new()
+    }
+}
+
 #[cfg(all(feature = "object_pinning", not(feature = "non_moving")))]
 #[no_mangle]
 pub extern "C" fn mmtk_pin_object(object: ObjectReference) -> bool {
     if mmtk_address_is_in_heap(object.to_raw_address().as_usize()) {
-        memory_manager::pin_object(object)
+        let mut pinned = memory_manager::pin_object(object);
+        if !pinned {
+            pinned = memory_manager::is_pinned(object);
+        }
+
+        // Stick the object so it is never swept while libuv is holding it!
+        mmtk_stick_object(object);
+
+        // Recursive pinning of stream buffers to prevent GC from relocating them
+        // while libuv is asynchronously reading/writing from/to their raw addresses.
+        let name_str = unsafe { get_object_type_name(object) };
+        if !name_str.is_empty() {
+            if name_str == "PipeEndpoint"
+                || name_str == "TTY"
+                || name_str == "TCPSocket"
+                || name_str == "Pipe"
+            {
+                // Read buffer field at offset 16 (index 2)
+                let buf_ptr = unsafe {
+                    Address::from_usize(object.to_raw_address().as_usize() + 16).load::<Address>()
+                };
+                if buf_ptr.is_mapped()
+                    && !buf_ptr.is_zero()
+                    && mmtk_address_is_in_heap(buf_ptr.as_usize())
+                {
+                    if let Some(buf_obj) = ObjectReference::from_raw_address(buf_ptr) {
+                        memory_manager::pin_object(buf_obj);
+                        mmtk_stick_object(buf_obj);
+                        // Read data field inside IOBuffer at offset 0 (index 0)
+                        let data_ptr = unsafe { buf_ptr.load::<Address>() };
+                        if data_ptr.is_mapped()
+                            && !data_ptr.is_zero()
+                            && mmtk_address_is_in_heap(data_ptr.as_usize())
+                        {
+                            if let Some(data_obj) = ObjectReference::from_raw_address(data_ptr) {
+                                memory_manager::pin_object(data_obj);
+                                mmtk_stick_object(data_obj);
+                            }
+                        }
+                    }
+                }
+                // Read sendbuf field at offset 40 (index 5)
+                let sendbuf_ptr = unsafe {
+                    Address::from_usize(object.to_raw_address().as_usize() + 40).load::<Address>()
+                };
+                if sendbuf_ptr.is_mapped()
+                    && !sendbuf_ptr.is_zero()
+                    && mmtk_address_is_in_heap(sendbuf_ptr.as_usize())
+                {
+                    if let Some(sendbuf_obj) = ObjectReference::from_raw_address(sendbuf_ptr) {
+                        memory_manager::pin_object(sendbuf_obj);
+                        mmtk_stick_object(sendbuf_obj);
+                        // Read data field inside sendbuf IOBuffer at offset 0 (index 0)
+                        let data_ptr = unsafe { sendbuf_ptr.load::<Address>() };
+                        if data_ptr.is_mapped()
+                            && !data_ptr.is_zero()
+                            && mmtk_address_is_in_heap(data_ptr.as_usize())
+                        {
+                            if let Some(data_obj) = ObjectReference::from_raw_address(data_ptr) {
+                                memory_manager::pin_object(data_obj);
+                                mmtk_stick_object(data_obj);
+                            }
+                        }
+                    }
+                }
+            } else if name_str == "IOBuffer" || name_str == "GenericIOBuffer" {
+                // Read data field at offset 0 (index 0)
+                let data_ptr = unsafe { object.to_raw_address().load::<Address>() };
+                if data_ptr.is_mapped()
+                    && !data_ptr.is_zero()
+                    && mmtk_address_is_in_heap(data_ptr.as_usize())
+                {
+                    if let Some(data_obj) = ObjectReference::from_raw_address(data_ptr) {
+                        memory_manager::pin_object(data_obj);
+                        mmtk_stick_object(data_obj);
+                    }
+                }
+            }
+        }
+        pinned
     } else {
         debug!("Object is not in MMTk heap - pinning it via this function isn't supported.");
         false
@@ -629,7 +776,74 @@ pub extern "C" fn mmtk_pin_object(object: ObjectReference) -> bool {
 #[no_mangle]
 pub extern "C" fn mmtk_unpin_object(object: ObjectReference) -> bool {
     if mmtk_address_is_in_heap(object.to_raw_address().as_usize()) {
-        memory_manager::unpin_object(object)
+        let unpinned = memory_manager::unpin_object(object);
+
+        // Recursive unpinning of stream buffers
+        let name_str = unsafe { get_object_type_name(object) };
+        if !name_str.is_empty() {
+            if name_str == "PipeEndpoint"
+                || name_str == "TTY"
+                || name_str == "TCPSocket"
+                || name_str == "Pipe"
+            {
+                // Read buffer field at offset 16 (index 2)
+                let buf_ptr = unsafe {
+                    Address::from_usize(object.to_raw_address().as_usize() + 16).load::<Address>()
+                };
+                if buf_ptr.is_mapped()
+                    && !buf_ptr.is_zero()
+                    && mmtk_address_is_in_heap(buf_ptr.as_usize())
+                {
+                    if let Some(buf_obj) = ObjectReference::from_raw_address(buf_ptr) {
+                        memory_manager::unpin_object(buf_obj);
+                        // Read data field inside IOBuffer at offset 0 (index 0)
+                        let data_ptr = unsafe { buf_ptr.load::<Address>() };
+                        if data_ptr.is_mapped()
+                            && !data_ptr.is_zero()
+                            && mmtk_address_is_in_heap(data_ptr.as_usize())
+                        {
+                            if let Some(data_obj) = ObjectReference::from_raw_address(data_ptr) {
+                                memory_manager::unpin_object(data_obj);
+                            }
+                        }
+                    }
+                }
+                // Read sendbuf field at offset 40 (index 5)
+                let sendbuf_ptr = unsafe {
+                    Address::from_usize(object.to_raw_address().as_usize() + 40).load::<Address>()
+                };
+                if sendbuf_ptr.is_mapped()
+                    && !sendbuf_ptr.is_zero()
+                    && mmtk_address_is_in_heap(sendbuf_ptr.as_usize())
+                {
+                    if let Some(sendbuf_obj) = ObjectReference::from_raw_address(sendbuf_ptr) {
+                        memory_manager::unpin_object(sendbuf_obj);
+                        // Read data field inside sendbuf IOBuffer at offset 0 (index 0)
+                        let data_ptr = unsafe { sendbuf_ptr.load::<Address>() };
+                        if data_ptr.is_mapped()
+                            && !data_ptr.is_zero()
+                            && mmtk_address_is_in_heap(data_ptr.as_usize())
+                        {
+                            if let Some(data_obj) = ObjectReference::from_raw_address(data_ptr) {
+                                memory_manager::unpin_object(data_obj);
+                            }
+                        }
+                    }
+                }
+            } else if name_str == "IOBuffer" || name_str == "GenericIOBuffer" {
+                // Read data field at offset 0 (index 0)
+                let data_ptr = unsafe { object.to_raw_address().load::<Address>() };
+                if data_ptr.is_mapped()
+                    && !data_ptr.is_zero()
+                    && mmtk_address_is_in_heap(data_ptr.as_usize())
+                {
+                    if let Some(data_obj) = ObjectReference::from_raw_address(data_ptr) {
+                        memory_manager::unpin_object(data_obj);
+                    }
+                }
+            }
+        }
+        unpinned
     } else {
         debug!("Object is not in MMTk heap - unpinning it via this function isn't supported.");
         false
@@ -954,11 +1168,11 @@ pub extern "C" fn jl_gc_is_valid_root(addr: *mut std::ffi::c_void) -> bool {
     if addr.is_null() {
         return false;
     }
-    if let Some(obj_ref) = unsafe { ObjectReference::from_raw_address(Address::from_ptr(addr)) } {
-        unsafe { crate::julia_scanning::is_valid_julia_object(obj_ref) }
-    } else {
-        false
+    let addr_usize = addr as usize;
+    if addr_usize % 8 != 0 || addr_usize < 0x20000 {
+        return false;
     }
+    true
 }
 
 #[no_mangle]
