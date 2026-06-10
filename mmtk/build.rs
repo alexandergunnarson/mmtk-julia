@@ -1,9 +1,18 @@
-extern crate bindgen;
 use std::path::Path;
 
-// Use bindgen to build Rust bindings for Julia
-
 fn main() {
+    // For standalone builds, skip all Julia-specific bindgen.
+    #[cfg(not(feature = "standalone"))]
+    hosted_build();
+
+    // built::write_built_file is only available when the 'built' dep is present.
+    #[cfg(not(feature = "standalone"))]
+    built::write_built_file().expect("Failed to acquire build-time information");
+}
+
+#[cfg(not(feature = "standalone"))]
+fn hosted_build() {
+    extern crate bindgen;
     // Use environment variable $JULIA_PATH that points to Julia folder
     let julia_dir_key = "JULIA_PATH";
     let mmtk_dir_key = "MMTK_JULIA_DIR";
@@ -96,6 +105,4 @@ fn main() {
             .write_to_file("src/julia_types.rs")
             .expect("Couldn't write bindings!");
     }
-
-    built::write_built_file().expect("Failed to acquire build-time information");
 }
