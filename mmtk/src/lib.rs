@@ -1,59 +1,59 @@
 #![allow(clippy::missing_safety_doc)]
 
-#[cfg(not(feature = "standalone"))]
+#[cfg(not(feature = "julia_mlir"))]
 extern crate libc;
 extern crate log;
 extern crate mmtk;
-#[cfg(not(feature = "standalone"))]
+#[cfg(not(feature = "julia_mlir"))]
 #[macro_use]
 extern crate lazy_static;
 
-#[cfg(not(feature = "standalone"))]
+#[cfg(not(feature = "julia_mlir"))]
 use mmtk::util::opaque_pointer::*;
-#[cfg(not(feature = "standalone"))]
+#[cfg(not(feature = "julia_mlir"))]
 use mmtk::util::Address;
-#[cfg(not(feature = "standalone"))]
+#[cfg(not(feature = "julia_mlir"))]
 use mmtk::vm::VMBinding;
-#[cfg(not(feature = "standalone"))]
+#[cfg(not(feature = "julia_mlir"))]
 use mmtk::MMTKBuilder;
-#[cfg(not(feature = "standalone"))]
+#[cfg(not(feature = "julia_mlir"))]
 use mmtk::MMTK;
 
-#[cfg(not(feature = "standalone"))]
+#[cfg(not(feature = "julia_mlir"))]
 use std::collections::HashMap;
-#[cfg(not(feature = "standalone"))]
+#[cfg(not(feature = "julia_mlir"))]
 use std::sync::atomic::AtomicIsize;
-#[cfg(not(feature = "standalone"))]
+#[cfg(not(feature = "julia_mlir"))]
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(not(feature = "standalone"))]
+#[cfg(not(feature = "julia_mlir"))]
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 
-#[cfg(not(feature = "standalone"))]
+#[cfg(not(feature = "julia_mlir"))]
 pub mod active_plan;
-#[cfg(not(feature = "standalone"))]
+#[cfg(not(feature = "julia_mlir"))]
 pub mod api;
-#[cfg(not(feature = "standalone"))]
+#[cfg(not(feature = "julia_mlir"))]
 mod build_info;
-#[cfg(not(feature = "standalone"))]
+#[cfg(not(feature = "julia_mlir"))]
 pub mod collection;
-#[cfg(not(feature = "standalone"))]
+#[cfg(not(feature = "julia_mlir"))]
 pub mod gc_trigger;
-#[cfg(not(feature = "standalone"))]
+#[cfg(not(feature = "julia_mlir"))]
 pub mod object_model;
-#[cfg(not(feature = "standalone"))]
+#[cfg(not(feature = "julia_mlir"))]
 pub mod reference_glue;
-#[cfg(not(feature = "standalone"))]
+#[cfg(not(feature = "julia_mlir"))]
 pub mod scanning;
-#[cfg(not(feature = "standalone"))]
+#[cfg(not(feature = "julia_mlir"))]
 pub mod slots;
-#[cfg(not(feature = "standalone"))]
+#[cfg(not(feature = "julia_mlir"))]
 pub mod util;
 
-#[cfg(not(feature = "standalone"))]
+#[cfg(not(feature = "julia_mlir"))]
 pub mod julia_finalizer;
-#[cfg(not(feature = "standalone"))]
+#[cfg(not(feature = "julia_mlir"))]
 pub mod julia_scanning;
-#[cfg(not(feature = "standalone"))]
+#[cfg(not(feature = "julia_mlir"))]
 #[allow(non_camel_case_types)]
 #[allow(improper_ctypes_definitions)]
 #[allow(non_upper_case_globals)]
@@ -62,20 +62,20 @@ pub mod julia_scanning;
 #[rustfmt::skip]
 pub mod julia_types;
 
-/// Standalone freestanding binding — no Julia C runtime dependency.
-/// Activated by `--features standalone`. Mutually exclusive with the
+/// VM binding for julia-mlir compiled binaries.
+/// Activated by `--features julia_mlir`. Mutually exclusive with the
 /// default Julia-hosted binding.
-#[cfg(feature = "standalone")]
-pub mod standalone;
+#[cfg(feature = "julia_mlir")]
+pub mod julia_mlir;
 
-#[cfg(not(feature = "standalone"))]
+#[cfg(not(feature = "julia_mlir"))]
 #[derive(Default)]
 pub struct JuliaVM;
 
-#[cfg(not(feature = "standalone"))]
+#[cfg(not(feature = "julia_mlir"))]
 use crate::slots::JuliaVMSlot;
 
-#[cfg(not(feature = "standalone"))]
+#[cfg(not(feature = "julia_mlir"))]
 impl VMBinding for JuliaVM {
     const MAX_ALIGNMENT: usize = 64;
     const MIN_ALIGNMENT: usize = 4;
@@ -88,11 +88,11 @@ impl VMBinding for JuliaVM {
     type VMSlot = JuliaVMSlot;
 }
 
-#[cfg(not(feature = "standalone"))]
+#[cfg(not(feature = "julia_mlir"))]
 /// This is used to ensure we initialize MMTk at a specified timing.
 pub static MMTK_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
-#[cfg(not(feature = "standalone"))]
+#[cfg(not(feature = "julia_mlir"))]
 lazy_static! {
     pub static ref BUILDER: Mutex<MMTKBuilder> = Mutex::new(MMTKBuilder::new());
     pub static ref SINGLETON: MMTK<JuliaVM> = {
@@ -104,28 +104,28 @@ lazy_static! {
     };
 }
 
-#[cfg(not(feature = "standalone"))]
+#[cfg(not(feature = "julia_mlir"))]
 pub static mut JULIA_HEADER_SIZE: usize = 0;
-#[cfg(not(feature = "standalone"))]
+#[cfg(not(feature = "julia_mlir"))]
 pub static mut JULIA_BUFF_TAG: usize = 0;
 
-#[cfg(not(feature = "standalone"))]
+#[cfg(not(feature = "julia_mlir"))]
 #[no_mangle]
 pub static BLOCK_FOR_GC: AtomicBool = AtomicBool::new(false);
 
-#[cfg(not(feature = "standalone"))]
+#[cfg(not(feature = "julia_mlir"))]
 #[no_mangle]
 pub static WORLD_HAS_STOPPED: AtomicBool = AtomicBool::new(false);
 
-#[cfg(not(feature = "standalone"))]
+#[cfg(not(feature = "julia_mlir"))]
 #[no_mangle]
 pub static DISABLED_GC: AtomicBool = AtomicBool::new(false);
 
-#[cfg(not(feature = "standalone"))]
+#[cfg(not(feature = "julia_mlir"))]
 #[no_mangle]
 pub static USER_TRIGGERED_GC: AtomicIsize = AtomicIsize::new(0);
 
-#[cfg(not(feature = "standalone"))]
+#[cfg(not(feature = "julia_mlir"))]
 lazy_static! {
     pub static ref STW_COND: Arc<(Mutex<usize>, Condvar)> =
         Arc::new((Mutex::new(0), Condvar::new()));
@@ -139,10 +139,10 @@ lazy_static! {
     pub static ref MUTATORS: RwLock<HashMap<Address, Address>> = RwLock::new(HashMap::new());
 }
 
-#[cfg(not(feature = "standalone"))]
+#[cfg(not(feature = "julia_mlir"))]
 type ProcessSlotFn = *const extern "C" fn(closure: Address, slot: Address);
 
-#[cfg(not(feature = "standalone"))]
+#[cfg(not(feature = "julia_mlir"))]
 #[allow(improper_ctypes)]
 extern "C" {
     pub fn jl_gc_scan_julia_exc_obj(obj: Address, closure: Address, process_slot: ProcessSlotFn);
@@ -168,7 +168,7 @@ extern "C" {
     pub static mut MMTK_SIDE_LOG_BIT_BASE_ADDRESS: Address;
 }
 
-#[cfg(not(feature = "standalone"))]
+#[cfg(not(feature = "julia_mlir"))]
 pub(crate) fn set_panic_hook() {
     let old_hook = std::panic::take_hook();
 

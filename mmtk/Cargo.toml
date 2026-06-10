@@ -44,12 +44,13 @@ hosted = [
     "dep:cc", "dep:built", "dep:bindgen",
 ]
 
-# Standalone freestanding binding: zero C runtime dependency.
+# julia-mlir binding: for binaries compiled by the julia-mlir compiler.
 # Mutually exclusive with 'hosted'.
-standalone = ["standalone_immix"]
-standalone_nogc = []
-standalone_immix = ["mmtk/immix_non_moving", "mmtk/single_worker"]
-standalone_lxr = []
+julia_mlir = ["julia_mlir_immix"]
+julia_mlir_nogc = []
+julia_mlir_immix = ["mmtk/immix_non_moving", "mmtk/single_worker"]
+julia_mlir_immix_moving = ["mmtk/single_worker"]
+julia_mlir_lxr = []
 
 # Plans (hosted)
 nogc = []

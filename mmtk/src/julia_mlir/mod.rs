@@ -1,22 +1,21 @@
-//! Standalone MMTk binding for MLIR-Julia freestanding binaries.
+//! MMTk VM binding for the julia-mlir compiler's object model.
 //!
-//! This crate provides the VMBinding trait implementation needed by MMTk,
-//! without any dependency on Julia's C runtime. It exposes a C API that
-//! the MLIR-compiled freestanding binary calls for heap initialization
-//! and object allocation.
+//! This module provides the VMBinding trait implementation for binaries
+//! compiled by julia-mlir. The object model differs from stock Julia:
+//! type descriptors with nfields/instance_size replace jl_datatype_t,
+//! and a shadow stack replaces Julia's GC frame mechanism.
 //!
 //! Architecture:
 //! - Single-threaded initially (single GC worker for Immix/LXR).
 //! - Object model: [tag_word 8B | body NB]. Tag = raw DataType pointer.
 //!   MMTk side metadata handles GC bits; the tag word has no GC metadata.
-//! - No libc dependency in the public API. The binary uses raw syscalls;
-//!   this crate uses Rust's std internally (MMTk requires it), backed
-//!   by the thin libc shim (deps/libc-shim/) for freestanding linking.
+//! - No dependency on Julia's C runtime.
 //!
 //! Plan ladder (selected via Cargo features):
-//!   nogc    → NoGC (bring-up, allocation only)
-//!   immix   → Non-moving Immix (first real GC)
-//!   lxr     → LXR (RC + concurrent tracing, destination plan)
+//!   julia_mlir_nogc          → NoGC (bring-up, allocation only)
+//!   julia_mlir_immix         → Non-moving Immix (first real GC)
+//!   julia_mlir_immix_moving  → Moving Immix (objects relocate)
+//!   julia_mlir_lxr           → LXR (RC + concurrent tracing, destination plan)
 //!
 //! Object layout:
 //!   [tag_word 8B | field_0 8B | field_1 8B | ... | field_N 8B]
@@ -64,18 +63,18 @@ const TYPE_FLAG_ABSTRACT: u64 = 0x1;
 
 /// The standalone Julia VM binding — no C runtime, no jl_tls, no tasks.
 #[derive(Default)]
-pub struct StandaloneJuliaVM;
+pub struct JuliaMlirVM;
 
-impl VMBinding for StandaloneJuliaVM {
+impl VMBinding for JuliaMlirVM {
     /// Julia objects are 16-byte aligned (matching jl_gc_alloc).
     const MAX_ALIGNMENT: usize = 16;
     const MIN_ALIGNMENT: usize = 8;
 
-    type VMObjectModel = StandaloneObjectModel;
-    type VMScanning = StandaloneScanning;
-    type VMCollection = StandaloneCollection;
-    type VMActivePlan = StandaloneActivePlan;
-    type VMReferenceGlue = StandaloneReferenceGlue;
+    type VMObjectModel = JuliaMlirObjectModel;
+    type VMScanning = JuliaMlirScanning;
+    type VMCollection = JuliaMlirCollection;
+    type VMActivePlan = JuliaMlirActivePlan;
+    type VMReferenceGlue = JuliaMlirReferenceGlue;
     type VMMemorySlice = mmtk::vm::slot::UnimplementedMemorySlice<SimpleSlot>;
     type VMSlot = SimpleSlot;
 }
@@ -92,7 +91,7 @@ impl VMBinding for StandaloneJuliaVM {
 /// GC metadata (mark bits, forwarding, pinning) is stored in MMTk's side
 /// metadata tables, indexed by object address. The tag word is clean —
 /// no GC bits encoded in it.
-pub struct StandaloneObjectModel;
+pub struct JuliaMlirObjectModel;
 
 // Side metadata specs — must match the ordering expected by mmtk-core.
 pub(crate) const LOGGING_SIDE_METADATA_SPEC: VMGlobalLogBitSpec = VMGlobalLogBitSpec::side_first();
@@ -106,7 +105,7 @@ pub(crate) const LOS_METADATA_SPEC: VMLocalLOSMarkNurserySpec =
 pub(crate) const MARKING_METADATA_SPEC: VMLocalMarkBitSpec =
     VMLocalMarkBitSpec::side_after(LOS_METADATA_SPEC.as_spec());
 
-impl ObjectModel<StandaloneJuliaVM> for StandaloneObjectModel {
+impl ObjectModel<JuliaMlirVM> for JuliaMlirObjectModel {
     const GLOBAL_LOG_BIT_SPEC: VMGlobalLogBitSpec = LOGGING_SIDE_METADATA_SPEC;
     const GLOBAL_FIELD_UNLOG_BIT_SPEC: VMGlobalFieldUnlogBitSpec = FIELD_UNLOG_SIDE_METADATA_SPEC;
 
@@ -125,7 +124,7 @@ impl ObjectModel<StandaloneJuliaVM> for StandaloneObjectModel {
     fn copy(
         from: ObjectReference,
         semantics: mmtk::util::copy::CopySemantics,
-        copy_context: &mut mmtk::util::copy::GCWorkerCopyContext<StandaloneJuliaVM>,
+        copy_context: &mut mmtk::util::copy::GCWorkerCopyContext<JuliaMlirVM>,
     ) -> ObjectReference {
         let bytes = Self::get_current_size(from);
         let from_start = Self::ref_to_object_start(from);
@@ -217,12 +216,12 @@ impl ObjectModel<StandaloneJuliaVM> for StandaloneObjectModel {
 // Scanning — real object scanning for Immix/LXR
 // ============================================================================
 
-pub struct StandaloneScanning;
+pub struct JuliaMlirScanning;
 
-impl Scanning<StandaloneJuliaVM> for StandaloneScanning {
+impl Scanning<JuliaMlirVM> for JuliaMlirScanning {
     fn scan_roots_in_mutator_thread(
         _tls: VMWorkerThread,
-        _mutator: &'static mut Mutator<StandaloneJuliaVM>,
+        _mutator: &'static mut Mutator<JuliaMlirVM>,
         mut factory: impl RootsWorkFactory<SimpleSlot>,
     ) {
         // Enumerate roots from the GC root stack.
@@ -403,8 +402,8 @@ impl Scanning<StandaloneJuliaVM> for StandaloneScanning {
     fn prepare_for_roots_re_scanning() {}
 
     fn process_weak_refs(
-        _worker: &mut mmtk::scheduler::GCWorker<StandaloneJuliaVM>,
-        _tracer_context: impl ObjectTracerContext<StandaloneJuliaVM>,
+        _worker: &mut mmtk::scheduler::GCWorker<JuliaMlirVM>,
+        _tracer_context: impl ObjectTracerContext<JuliaMlirVM>,
     ) -> bool {
         // No weak references in standalone (yet).
         false
@@ -415,7 +414,7 @@ impl Scanning<StandaloneJuliaVM> for StandaloneScanning {
 // Collection — real GC for Immix
 // ============================================================================
 
-pub struct StandaloneCollection;
+pub struct JuliaMlirCollection;
 
 /// Global flag: set by GC worker to request mutator stop.
 static GC_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -426,13 +425,13 @@ static MUTATOR_STOPPED: AtomicBool = AtomicBool::new(false);
 /// Global flag: set by GC worker to resume the mutator.
 static GC_DONE: AtomicBool = AtomicBool::new(false);
 
-impl Collection<StandaloneJuliaVM> for StandaloneCollection {
+impl Collection<JuliaMlirVM> for JuliaMlirCollection {
     fn stop_all_mutators<F>(
         _tls: VMWorkerThread,
         mut mutator_visitor: F,
         _current_gc_should_unload_classes: bool,
     ) where
-        F: FnMut(&'static mut Mutator<StandaloneJuliaVM>),
+        F: FnMut(&'static mut Mutator<JuliaMlirVM>),
     {
         // Report GC start (initializes the GC_START_TIME timer that
         // dump_gc_stats reads — the lxr-julia-v2 branch of mmtk-core
@@ -451,7 +450,7 @@ impl Collection<StandaloneJuliaVM> for StandaloneCollection {
         unsafe {
             let mutator_ptr = THE_MUTATOR.load(Ordering::SeqCst);
             if mutator_ptr != 0 {
-                let mutator = &mut *(mutator_ptr as *mut Mutator<StandaloneJuliaVM>);
+                let mutator = &mut *(mutator_ptr as *mut Mutator<JuliaMlirVM>);
                 mutator_visitor(mutator);
             }
         }
@@ -479,7 +478,7 @@ impl Collection<StandaloneJuliaVM> for StandaloneCollection {
         GC_COUNT.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn spawn_gc_thread(_tls: VMThread, ctx: GCThreadContext<StandaloneJuliaVM>) {
+    fn spawn_gc_thread(_tls: VMThread, ctx: GCThreadContext<JuliaMlirVM>) {
         // Spawn a real GC worker thread for Immix collection.
         let _ = std::thread::Builder::new()
             .name("MMTk Worker".to_string())
@@ -520,12 +519,12 @@ impl Collection<StandaloneJuliaVM> for StandaloneCollection {
 // Active plan — single-threaded, one mutator
 // ============================================================================
 
-pub struct StandaloneActivePlan;
+pub struct JuliaMlirActivePlan;
 
 /// Pointer to the single mutator (set by jlmlir_bind_mutator).
 static THE_MUTATOR: AtomicUsize = AtomicUsize::new(0);
 
-impl ActivePlan<StandaloneJuliaVM> for StandaloneActivePlan {
+impl ActivePlan<JuliaMlirVM> for JuliaMlirActivePlan {
     fn number_of_mutators() -> usize {
         1
     }
@@ -534,20 +533,20 @@ impl ActivePlan<StandaloneJuliaVM> for StandaloneActivePlan {
         true
     }
 
-    fn mutator(_tls: VMMutatorThread) -> &'static mut Mutator<StandaloneJuliaVM> {
+    fn mutator(_tls: VMMutatorThread) -> &'static mut Mutator<JuliaMlirVM> {
         unsafe {
             let ptr = THE_MUTATOR.load(Ordering::Relaxed);
-            &mut *(ptr as *mut Mutator<StandaloneJuliaVM>)
+            &mut *(ptr as *mut Mutator<JuliaMlirVM>)
         }
     }
 
-    fn mutators<'a>() -> Box<dyn Iterator<Item = &'a mut Mutator<StandaloneJuliaVM>> + 'a> {
+    fn mutators<'a>() -> Box<dyn Iterator<Item = &'a mut Mutator<JuliaMlirVM>> + 'a> {
         let ptr = THE_MUTATOR.load(Ordering::Relaxed);
         if ptr == 0 {
             Box::new(std::iter::empty())
         } else {
             Box::new(std::iter::once(unsafe {
-                &mut *(ptr as *mut Mutator<StandaloneJuliaVM>)
+                &mut *(ptr as *mut Mutator<JuliaMlirVM>)
             }))
         }
     }
@@ -555,7 +554,7 @@ impl ActivePlan<StandaloneJuliaVM> for StandaloneActivePlan {
     fn vm_trace_object<Q: mmtk::plan::ObjectQueue>(
         queue: &mut Q,
         object: ObjectReference,
-        _worker: &mut mmtk::scheduler::GCWorker<StandaloneJuliaVM>,
+        _worker: &mut mmtk::scheduler::GCWorker<JuliaMlirVM>,
     ) -> ObjectReference {
         queue.enqueue(object);
         object
@@ -566,7 +565,7 @@ impl ActivePlan<StandaloneJuliaVM> for StandaloneActivePlan {
 // Reference glue — no weak/soft/phantom references in standalone
 // ============================================================================
 
-pub struct StandaloneReferenceGlue;
+pub struct JuliaMlirReferenceGlue;
 
 #[derive(Clone, Copy, Debug)]
 pub struct DummyFinalizable(pub ObjectReference);
@@ -581,7 +580,7 @@ impl mmtk::vm::Finalizable for DummyFinalizable {
     fn keep_alive<E: mmtk::scheduler::ProcessEdgesWork>(&mut self, _trace: &mut E) {}
 }
 
-impl ReferenceGlue<StandaloneJuliaVM> for StandaloneReferenceGlue {
+impl ReferenceGlue<JuliaMlirVM> for JuliaMlirReferenceGlue {
     type FinalizableType = DummyFinalizable;
 
     fn set_referent(_reference: ObjectReference, _referent: ObjectReference) {}
@@ -600,9 +599,9 @@ static MMTK_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 // Use raw static mut instead of lazy_static to avoid TLS issues in freestanding.
 // Safety: jlmlir_gc_init is called exactly once before any other MMTk call.
-static mut MMTK_INSTANCE: Option<Box<MMTK<StandaloneJuliaVM>>> = None;
+static mut MMTK_INSTANCE: Option<Box<MMTK<JuliaMlirVM>>> = None;
 
-fn get_mmtk() -> &'static MMTK<StandaloneJuliaVM> {
+fn get_mmtk() -> &'static MMTK<JuliaMlirVM> {
     unsafe { MMTK_INSTANCE.as_ref().expect("MMTk not initialized") }
 }
 
@@ -642,15 +641,19 @@ pub unsafe extern "C" fn jlmlir_gc_init(heap_size: usize) {
     // Select plan based on Cargo feature flags.
     use mmtk::util::options::PlanSelector;
 
-    #[cfg(feature = "standalone_immix")]
+    #[cfg(any(feature = "julia_mlir_immix", feature = "julia_mlir_immix_moving"))]
     {
         builder.options.plan.set(PlanSelector::Immix);
     }
-    #[cfg(feature = "standalone_lxr")]
+    #[cfg(feature = "julia_mlir_lxr")]
     {
         builder.options.plan.set(PlanSelector::LXR);
     }
-    #[cfg(all(not(feature = "standalone_immix"), not(feature = "standalone_lxr")))]
+    #[cfg(all(
+        not(feature = "julia_mlir_immix"),
+        not(feature = "julia_mlir_immix_moving"),
+        not(feature = "julia_mlir_lxr"),
+    ))]
     {
         builder.options.plan.set(PlanSelector::NoGC);
     }
@@ -684,7 +687,7 @@ pub unsafe extern "C" fn jlmlir_gc_init(heap_size: usize) {
 /// Single-threaded: called once. The returned pointer must be passed
 /// to all subsequent allocation calls.
 #[no_mangle]
-pub unsafe extern "C" fn jlmlir_bind_mutator() -> *mut Mutator<StandaloneJuliaVM> {
+pub unsafe extern "C" fn jlmlir_bind_mutator() -> *mut Mutator<JuliaMlirVM> {
     let tls = VMMutatorThread(VMThread(OpaquePointer::from_address(Address::from_usize(
         1,
     ))));
@@ -707,7 +710,7 @@ pub unsafe extern "C" fn jlmlir_bind_mutator() -> *mut Mutator<StandaloneJuliaVM
 /// * `body_size` - Size of the body in bytes (not including tag word).
 #[no_mangle]
 pub unsafe extern "C" fn jlmlir_alloc(
-    mutator: *mut Mutator<StandaloneJuliaVM>,
+    mutator: *mut Mutator<JuliaMlirVM>,
     body_size: usize,
 ) -> *mut u8 {
     // Total: [tag 8B | body]
@@ -745,7 +748,7 @@ pub unsafe extern "C" fn jlmlir_alloc(
 /// Returns pointer to body start.
 #[no_mangle]
 pub unsafe extern "C" fn jlmlir_alloc_typed(
-    mutator: *mut Mutator<StandaloneJuliaVM>,
+    mutator: *mut Mutator<JuliaMlirVM>,
     body_size: usize,
     type_tag: usize,
 ) -> *mut u8 {
@@ -847,7 +850,7 @@ pub unsafe extern "C" fn jlmlir_gc_safepoint() -> u32 {
         let tls = VMMutatorThread(VMThread(OpaquePointer::from_address(Address::from_usize(
             1,
         ))));
-        <StandaloneCollection as Collection<StandaloneJuliaVM>>::block_for_gc(tls);
+        <JuliaMlirCollection as Collection<JuliaMlirVM>>::block_for_gc(tls);
         GC_COUNT.fetch_add(1, Ordering::Relaxed);
         1
     } else {
