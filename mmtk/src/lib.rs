@@ -1,59 +1,59 @@
 #![allow(clippy::missing_safety_doc)]
 
-#[cfg(not(feature = "julia_mlir"))]
+#[cfg(feature = "hosted")]
 extern crate libc;
 extern crate log;
 extern crate mmtk;
-#[cfg(not(feature = "julia_mlir"))]
+#[cfg(feature = "hosted")]
 #[macro_use]
 extern crate lazy_static;
 
-#[cfg(not(feature = "julia_mlir"))]
+#[cfg(feature = "hosted")]
 use mmtk::util::opaque_pointer::*;
-#[cfg(not(feature = "julia_mlir"))]
+#[cfg(feature = "hosted")]
 use mmtk::util::Address;
-#[cfg(not(feature = "julia_mlir"))]
+#[cfg(feature = "hosted")]
 use mmtk::vm::VMBinding;
-#[cfg(not(feature = "julia_mlir"))]
+#[cfg(feature = "hosted")]
 use mmtk::MMTKBuilder;
-#[cfg(not(feature = "julia_mlir"))]
+#[cfg(feature = "hosted")]
 use mmtk::MMTK;
 
-#[cfg(not(feature = "julia_mlir"))]
+#[cfg(feature = "hosted")]
 use std::collections::HashMap;
-#[cfg(not(feature = "julia_mlir"))]
+#[cfg(feature = "hosted")]
 use std::sync::atomic::AtomicIsize;
-#[cfg(not(feature = "julia_mlir"))]
+#[cfg(feature = "hosted")]
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(not(feature = "julia_mlir"))]
+#[cfg(feature = "hosted")]
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 
-#[cfg(not(feature = "julia_mlir"))]
+#[cfg(feature = "hosted")]
 pub mod active_plan;
-#[cfg(not(feature = "julia_mlir"))]
+#[cfg(feature = "hosted")]
 pub mod api;
-#[cfg(not(feature = "julia_mlir"))]
+#[cfg(feature = "hosted")]
 mod build_info;
-#[cfg(not(feature = "julia_mlir"))]
+#[cfg(feature = "hosted")]
 pub mod collection;
-#[cfg(not(feature = "julia_mlir"))]
+#[cfg(feature = "hosted")]
 pub mod gc_trigger;
-#[cfg(not(feature = "julia_mlir"))]
+#[cfg(feature = "hosted")]
 pub mod object_model;
-#[cfg(not(feature = "julia_mlir"))]
+#[cfg(feature = "hosted")]
 pub mod reference_glue;
-#[cfg(not(feature = "julia_mlir"))]
+#[cfg(feature = "hosted")]
 pub mod scanning;
-#[cfg(not(feature = "julia_mlir"))]
+#[cfg(feature = "hosted")]
 pub mod slots;
-#[cfg(not(feature = "julia_mlir"))]
+#[cfg(feature = "hosted")]
 pub mod util;
 
-#[cfg(not(feature = "julia_mlir"))]
+#[cfg(feature = "hosted")]
 pub mod julia_finalizer;
-#[cfg(not(feature = "julia_mlir"))]
+#[cfg(feature = "hosted")]
 pub mod julia_scanning;
-#[cfg(not(feature = "julia_mlir"))]
+#[cfg(feature = "hosted")]
 #[allow(non_camel_case_types)]
 #[allow(improper_ctypes_definitions)]
 #[allow(non_upper_case_globals)]
@@ -65,17 +65,17 @@ pub mod julia_types;
 /// VM binding for julia-mlir compiled binaries.
 /// Activated by `--features julia_mlir`. Mutually exclusive with the
 /// default Julia-hosted binding.
-#[cfg(feature = "julia_mlir")]
+#[cfg(not(feature = "hosted"))]
 pub mod julia_mlir;
 
-#[cfg(not(feature = "julia_mlir"))]
+#[cfg(feature = "hosted")]
 #[derive(Default)]
 pub struct JuliaVM;
 
-#[cfg(not(feature = "julia_mlir"))]
+#[cfg(feature = "hosted")]
 use crate::slots::JuliaVMSlot;
 
-#[cfg(not(feature = "julia_mlir"))]
+#[cfg(feature = "hosted")]
 impl VMBinding for JuliaVM {
     const MAX_ALIGNMENT: usize = 64;
     const MIN_ALIGNMENT: usize = 4;
@@ -88,11 +88,11 @@ impl VMBinding for JuliaVM {
     type VMSlot = JuliaVMSlot;
 }
 
-#[cfg(not(feature = "julia_mlir"))]
+#[cfg(feature = "hosted")]
 /// This is used to ensure we initialize MMTk at a specified timing.
 pub static MMTK_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
-#[cfg(not(feature = "julia_mlir"))]
+#[cfg(feature = "hosted")]
 lazy_static! {
     pub static ref BUILDER: Mutex<MMTKBuilder> = Mutex::new(MMTKBuilder::new());
     pub static ref SINGLETON: MMTK<JuliaVM> = {
@@ -104,28 +104,28 @@ lazy_static! {
     };
 }
 
-#[cfg(not(feature = "julia_mlir"))]
+#[cfg(feature = "hosted")]
 pub static mut JULIA_HEADER_SIZE: usize = 0;
-#[cfg(not(feature = "julia_mlir"))]
+#[cfg(feature = "hosted")]
 pub static mut JULIA_BUFF_TAG: usize = 0;
 
-#[cfg(not(feature = "julia_mlir"))]
+#[cfg(feature = "hosted")]
 #[no_mangle]
 pub static BLOCK_FOR_GC: AtomicBool = AtomicBool::new(false);
 
-#[cfg(not(feature = "julia_mlir"))]
+#[cfg(feature = "hosted")]
 #[no_mangle]
 pub static WORLD_HAS_STOPPED: AtomicBool = AtomicBool::new(false);
 
-#[cfg(not(feature = "julia_mlir"))]
+#[cfg(feature = "hosted")]
 #[no_mangle]
 pub static DISABLED_GC: AtomicBool = AtomicBool::new(false);
 
-#[cfg(not(feature = "julia_mlir"))]
+#[cfg(feature = "hosted")]
 #[no_mangle]
 pub static USER_TRIGGERED_GC: AtomicIsize = AtomicIsize::new(0);
 
-#[cfg(not(feature = "julia_mlir"))]
+#[cfg(feature = "hosted")]
 lazy_static! {
     pub static ref STW_COND: Arc<(Mutex<usize>, Condvar)> =
         Arc::new((Mutex::new(0), Condvar::new()));
@@ -139,10 +139,10 @@ lazy_static! {
     pub static ref MUTATORS: RwLock<HashMap<Address, Address>> = RwLock::new(HashMap::new());
 }
 
-#[cfg(not(feature = "julia_mlir"))]
+#[cfg(feature = "hosted")]
 type ProcessSlotFn = *const extern "C" fn(closure: Address, slot: Address);
 
-#[cfg(not(feature = "julia_mlir"))]
+#[cfg(feature = "hosted")]
 #[allow(improper_ctypes)]
 extern "C" {
     pub fn jl_gc_scan_julia_exc_obj(obj: Address, closure: Address, process_slot: ProcessSlotFn);
@@ -168,7 +168,7 @@ extern "C" {
     pub static mut MMTK_SIDE_LOG_BIT_BASE_ADDRESS: Address;
 }
 
-#[cfg(not(feature = "julia_mlir"))]
+#[cfg(feature = "hosted")]
 pub(crate) fn set_panic_hook() {
     let old_hook = std::panic::take_hook();
 

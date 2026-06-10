@@ -1,16 +1,16 @@
 use std::path::Path;
 
 fn main() {
-    // For standalone builds, skip all Julia-specific bindgen.
-    #[cfg(not(feature = "julia_mlir"))]
+    // For julia_mlir builds, skip all Julia-specific bindgen.
+    #[cfg(feature = "hosted")]
     hosted_build();
 
     // built::write_built_file is only available when the 'built' dep is present.
-    #[cfg(not(feature = "julia_mlir"))]
+    #[cfg(feature = "hosted")]
     built::write_built_file().expect("Failed to acquire build-time information");
 }
 
-#[cfg(not(feature = "julia_mlir"))]
+#[cfg(feature = "hosted")]
 fn hosted_build() {
     extern crate bindgen;
     // Use environment variable $JULIA_PATH that points to Julia folder
