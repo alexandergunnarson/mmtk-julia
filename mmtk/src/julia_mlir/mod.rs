@@ -53,9 +53,21 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 const TYPEDESC_OFF_INSTANCE_SZ: usize = 8;
 const TYPEDESC_OFF_NFIELDS: usize = 16;
 const TYPEDESC_OFF_FLAGS: usize = 32;
-const TYPEDESC_OFF_FIELD_TYPES: usize = 48;
+/// Pointer bitmap: bit i set ⇔ word i of the body is a managed pointer.
+/// Supports up to 64 fields. Zero means no pointer fields.
+const TYPEDESC_OFF_PTR_BITMAP: usize = 48;
+/// Element size (for array types): size in bytes of each element.
+/// Zero means not an array type.
+const TYPEDESC_OFF_ELEM_SIZE: usize = 56;
 
 const TYPE_FLAG_ABSTRACT: u64 = 0x1;
+/// Flag indicating this type is a variable-size array (data stored inline).
+/// Array body layout: [length 8B | capacity 8B | elem_type_ptr 8B | data...]
+const TYPE_FLAG_VARSIZE: u64 = 0x8;
+/// Flag indicating this type is a Memory (fixed-size inline data buffer).
+/// Memory body layout: [length 8B | data[0..length*elem_size]]
+/// Simpler than VARSIZE arrays: no capacity, no elem_type_ptr.
+const TYPE_FLAG_MEMORY: u64 = 0x10;
 
 // ============================================================================
 // VM binding type
@@ -112,8 +124,14 @@ impl ObjectModel<JuliaMlirVM> for JuliaMlirObjectModel {
     const LOCAL_FORWARDING_POINTER_SPEC: VMLocalForwardingPointerSpec =
         VMLocalForwardingPointerSpec::in_header(-64);
 
+    // Forwarding bits in the header: use the lowest 2 bits of the tag word
+    // (same location as the forwarding pointer, offset -64 bits from ObjectRef).
+    // The tag word holds a DataType pointer with 16-byte alignment, so the
+    // bottom 4 bits are available. LXR's RC-enabled Immix space does NOT
+    // include forwarding bits in its local side-metadata list, so putting
+    // them in side metadata would leave them unmapped → SIGSEGV.
     const LOCAL_FORWARDING_BITS_SPEC: VMLocalForwardingBitsSpec =
-        VMLocalForwardingBitsSpec::side_after(MARKING_METADATA_SPEC.as_spec());
+        VMLocalForwardingBitsSpec::in_header(-64);
 
     const LOCAL_MARK_BIT_SPEC: VMLocalMarkBitSpec = MARKING_METADATA_SPEC;
     const LOCAL_LOS_MARK_NURSERY_SPEC: VMLocalLOSMarkNurserySpec = LOS_METADATA_SPEC;
@@ -147,9 +165,13 @@ impl ObjectModel<JuliaMlirVM> for JuliaMlirObjectModel {
     }
 
     fn get_current_size(object: ObjectReference) -> usize {
-        // Read instance_size from the type descriptor.
-        // tag_word at (obj - 8), type descriptor at *tag_word,
-        // instance_size at type_desc + 8.
+        // Read size from the type descriptor.
+        // tag_word at (obj - 8), type descriptor at *tag_word.
+        //
+        // For fixed-size objects: total = 8 + instance_size
+        // For variable-size (array) objects (TYPE_FLAG_VARSIZE set):
+        //   Body layout: [length 8B | capacity 8B | elem_type_ptr 8B | data[0..capacity*elem_size]]
+        //   total = 8 + 24 + capacity * elem_size
         unsafe {
             let tag_addr = object.to_raw_address() - 8usize;
             let type_desc = Address::from_usize(tag_addr.load::<usize>());
@@ -158,10 +180,34 @@ impl ObjectModel<JuliaMlirVM> for JuliaMlirObjectModel {
                 // Return minimum object size (tag + 16-byte align).
                 return 16;
             }
-            let instance_size = (type_desc + TYPEDESC_OFF_INSTANCE_SZ).load::<u64>() as usize;
-            // Total allocation size: tag_word (8B) + body, aligned to 16
-            let total = 8 + instance_size;
-            (total + 15) & !15
+
+            let flags = (type_desc + TYPEDESC_OFF_FLAGS).load::<u64>();
+            if flags & TYPE_FLAG_MEMORY != 0 {
+                // Memory object (fixed-size inline data buffer).
+                // Body: [length 8B | data[0..length*elem_size]]
+                let obj_addr = object.to_raw_address();
+                let length = obj_addr.load::<u64>() as usize; // offset 0 in body
+                let elem_size = (type_desc + TYPEDESC_OFF_ELEM_SIZE).load::<u64>() as usize;
+                let header_size = 8; // length only
+                let data_size = length * elem_size;
+                let total = 8 + header_size + data_size; // tag + header + data
+                (total + 15) & !15
+            } else if flags & TYPE_FLAG_VARSIZE != 0 {
+                // Variable-size (array) object.
+                // Body: [length 8B | capacity 8B | elem_type_ptr 8B | data...]
+                let obj_addr = object.to_raw_address();
+                let capacity = (obj_addr + 8usize).load::<u64>() as usize; // offset 8 in body
+                let elem_size = (type_desc + TYPEDESC_OFF_ELEM_SIZE).load::<u64>() as usize;
+                let header_size = 24; // length + capacity + elem_type_ptr
+                let data_size = capacity * elem_size;
+                let total = 8 + header_size + data_size; // tag + header + data
+                (total + 15) & !15
+            } else {
+                let instance_size = (type_desc + TYPEDESC_OFF_INSTANCE_SZ).load::<u64>() as usize;
+                // Total allocation size: tag_word (8B) + body, aligned to 16
+                let total = 8 + instance_size;
+                (total + 15) & !15
+            }
         }
     }
 
@@ -216,6 +262,42 @@ impl ObjectModel<JuliaMlirVM> for JuliaMlirObjectModel {
 // Scanning — real object scanning for Immix/LXR
 // ============================================================================
 
+/// Classify an object as Scalar, ObjArray, or ValArray by reading its type
+/// descriptor once.  All three trait methods (`is_obj_array`, `is_val_array`,
+/// `get_obj_kind`) delegate here so we never redundantly reload the tag.
+#[inline(always)]
+fn classify_object(o: ObjectReference) -> ObjectKind {
+    unsafe {
+        let tag_addr = o.to_raw_address() - 8usize;
+        let type_desc = Address::from_usize(tag_addr.load::<usize>());
+        if type_desc.is_zero() {
+            return ObjectKind::Scalar;
+        }
+        let flags = (type_desc + TYPEDESC_OFF_FLAGS).load::<u64>();
+
+        // Memory{T}: fixed-size inline data, classified like arrays for GC.
+        if flags & TYPE_FLAG_MEMORY != 0 {
+            let ptr_bitmap = (type_desc + TYPEDESC_OFF_PTR_BITMAP).load::<u64>();
+            if ptr_bitmap & 1 != 0 {
+                let elem_size = (type_desc + TYPEDESC_OFF_ELEM_SIZE).load::<u64>() as u32;
+                ObjectKind::ObjArray(elem_size)
+            } else {
+                ObjectKind::ValArray
+            }
+        } else if flags & TYPE_FLAG_VARSIZE != 0 {
+            let ptr_bitmap = (type_desc + TYPEDESC_OFF_PTR_BITMAP).load::<u64>();
+            if ptr_bitmap & 1 != 0 {
+                let elem_size = (type_desc + TYPEDESC_OFF_ELEM_SIZE).load::<u64>() as u32;
+                ObjectKind::ObjArray(elem_size)
+            } else {
+                ObjectKind::ValArray
+            }
+        } else {
+            ObjectKind::Scalar
+        }
+    }
+}
+
 pub struct JuliaMlirScanning;
 
 impl Scanning<JuliaMlirVM> for JuliaMlirScanning {
@@ -226,13 +308,22 @@ impl Scanning<JuliaMlirVM> for JuliaMlirScanning {
     ) {
         // Enumerate roots from the GC root stack.
         // The MLIR-compiled code maintains a shadow stack at a well-known global:
-        //   _jlmlir_gc_root_stack_top -> pointer to top of root stack
-        //   _jlmlir_gc_root_stack_base -> pointer to base of root stack
+        //   GC_ROOT_STACK_TOP_ADDR -> address of the @_jlmlir_gc_root_top global
+        //                             (dereference to get current top value)
+        //   GC_ROOT_STACK_BASE    -> base address of the root stack array
         // Each entry on the stack is a pointer to a heap object (8 bytes).
+        //
+        // The MLIR code writes root_top directly to @_jlmlir_gc_root_top
+        // without any FFI call. We read it through indirection here.
         unsafe {
-            let top_ptr = GC_ROOT_STACK_TOP.load(Ordering::Relaxed);
+            let top_addr = GC_ROOT_STACK_TOP_ADDR.load(Ordering::Relaxed);
             let base_ptr = GC_ROOT_STACK_BASE.load(Ordering::Relaxed);
-            if top_ptr == 0 || base_ptr == 0 || top_ptr <= base_ptr {
+            if top_addr == 0 || base_ptr == 0 {
+                return;
+            }
+            // Dereference the top address to get the current top value
+            let top_ptr = *(top_addr as *const usize);
+            if top_ptr <= base_ptr {
                 return;
             }
 
@@ -300,10 +391,26 @@ impl Scanning<JuliaMlirVM> for JuliaMlirScanning {
         object: ObjectReference,
         slot_visitor: &mut impl SlotVisitor<SimpleSlot>,
     ) {
-        // Read the type descriptor to determine which fields are pointers.
-        // For N4a, all fields in the body are treated as potential pointers
-        // (conservative for correctness). The type descriptor's nfields
-        // and field_types guide precise scanning.
+        // Precise object scanning using the pointer bitmap in the type descriptor.
+        //
+        // Descriptor slot 6 (offset 48) holds a bitmap: bit i set ⇔ word i of
+        // the body is a managed pointer.  Only those fields are reported to the
+        // GC.  This is critical for LXR, whose RC pipeline (ProcessIncs) accesses
+        // side metadata keyed by the target address — passing non-pointer data
+        // (small integers, floats) as ObjectReferences causes unmapped-metadata
+        // SIGSEGVs.
+        //
+        // If the bitmap is zero and nfields > 0, no fields are pointers (all
+        // data).  If both nfields and bitmap are zero, there is nothing to scan.
+        //
+        // Variable-size (array) objects (TYPE_FLAG_VARSIZE set):
+        //   Body: [length 8B | capacity 8B | elem_type_ptr 8B | data...]
+        //   The header's elem_type_ptr (offset 16) is always a managed pointer.
+        //   If the element type has pointer elements (checked via elem_size == 8
+        //   and elem_type has ptr_bitmap or is boxed), scan all `length` data slots.
+        //   For now: if elem_size == 8 (pointer-sized), scan all data slots.
+        //   Unboxed element arrays (Int64, Float64) have elem_size == 8 but
+        //   ptr_bitmap indicates whether elements are pointers.
         unsafe {
             let obj_addr = object.to_raw_address();
             let tag_addr = obj_addr - 8usize;
@@ -314,41 +421,72 @@ impl Scanning<JuliaMlirVM> for JuliaMlirScanning {
 
             let flags = (type_desc_addr + TYPEDESC_OFF_FLAGS).load::<u64>();
             if flags & TYPE_FLAG_ABSTRACT != 0 {
-                // Abstract types have no instances — shouldn't be on the heap.
                 return;
             }
 
+            // Check for Memory objects (TYPE_FLAG_MEMORY).
+            // Memory body: [length 8B | data[0..length*elem_size]]
+            // No capacity, no elem_type_ptr — simpler than arrays.
+            if flags & TYPE_FLAG_MEMORY != 0 {
+                let ptr_bitmap = (type_desc_addr + TYPEDESC_OFF_PTR_BITMAP).load::<u64>();
+                if ptr_bitmap & 1 != 0 {
+                    // Elements are managed pointers — scan all `length` data slots.
+                    let length = obj_addr.load::<u64>() as usize;
+                    let data_start = obj_addr + 8usize; // after length header (1 × 8B)
+                    for i in 0..length {
+                        let slot_addr = data_start + (i * 8);
+                        let slot = SimpleSlot::from_address(slot_addr);
+                        slot_visitor.visit_slot(slot, false);
+                    }
+                }
+                // If ptr_bitmap bit 0 is not set, elements are unboxed data — no scanning.
+                return;
+            }
+
+            // Check for variable-size array objects (TYPE_FLAG_VARSIZE).
+            if flags & TYPE_FLAG_VARSIZE != 0 {
+                // Array body: [length 8B | capacity 8B | elem_type_ptr 8B | data...]
+                // The elem_type_ptr at body offset 16 is always a managed pointer → scan it.
+                let elem_type_slot_addr = obj_addr + 16usize;
+                let elem_type_slot = SimpleSlot::from_address(elem_type_slot_addr);
+                slot_visitor.visit_slot(elem_type_slot, false);
+
+                // Check ptr_bitmap: bit 0 set ⇒ array elements are managed pointers.
+                // This is a per-array-type flag (e.g., Vector{Any} has it, Vector{Int64} doesn't).
+                let ptr_bitmap = (type_desc_addr + TYPEDESC_OFF_PTR_BITMAP).load::<u64>();
+                if ptr_bitmap & 1 != 0 {
+                    // Elements are managed pointers — scan all `length` data slots.
+                    let length = obj_addr.load::<u64>() as usize;
+                    let data_start = obj_addr + 24usize; // after header (3 × 8B)
+                    for i in 0..length {
+                        let slot_addr = data_start + (i * 8);
+                        let slot = SimpleSlot::from_address(slot_addr);
+                        slot_visitor.visit_slot(slot, false);
+                    }
+                }
+                // If ptr_bitmap bit 0 is not set, elements are unboxed data — no scanning.
+                return;
+            }
+
+            let ptr_bitmap = (type_desc_addr + TYPEDESC_OFF_PTR_BITMAP).load::<u64>();
+            if ptr_bitmap == 0 {
+                // No pointer fields — nothing to scan.
+                return;
+            }
+
+            // Scan only the fields marked as pointers in the bitmap.
             let nfields = (type_desc_addr + TYPEDESC_OFF_NFIELDS).load::<u64>() as usize;
-            let field_types_ptr_val = (type_desc_addr + TYPEDESC_OFF_FIELD_TYPES).load::<usize>();
-
-            if nfields == 0 {
-                // No fields to scan (e.g., Int64, Float64, Bool, Nothing).
-                return;
-            }
-
-            if field_types_ptr_val != 0 {
-                // Precise scanning: use field_types to determine which fields are pointers.
-                // field_types is an array of type descriptor pointers.
-                // A field is a pointer if its type descriptor is non-null and the
-                // instance_size of that field's type is 0 (abstract/box) or > 0 (concrete heap type).
-                // For now, scan all fields conservatively — every 8-byte field
-                // that looks like a managed pointer is reported.
-                // TODO(N4b): Use field_types for precise per-field scanning
-                for i in 0..nfields {
-                    let field_addr = obj_addr + (i * 8);
-                    let slot = SimpleSlot::from_address(field_addr);
-                    slot_visitor.visit_slot(slot, false);
+            let max_field = nfields.min(64);
+            let mut bits = ptr_bitmap;
+            while bits != 0 {
+                let i = bits.trailing_zeros() as usize;
+                if i >= max_field {
+                    break;
                 }
-            } else {
-                // No field type info — conservatively scan all pointer-sized fields.
-                let instance_size =
-                    (type_desc_addr + TYPEDESC_OFF_INSTANCE_SZ).load::<u64>() as usize;
-                let num_words = instance_size / 8;
-                for i in 0..num_words {
-                    let field_addr = obj_addr + (i * 8);
-                    let slot = SimpleSlot::from_address(field_addr);
-                    slot_visitor.visit_slot(slot, false);
-                }
+                let field_addr = obj_addr + (i * 8);
+                let slot = SimpleSlot::from_address(field_addr);
+                slot_visitor.visit_slot(slot, false);
+                bits &= bits - 1; // clear lowest set bit
             }
         }
     }
@@ -371,9 +509,13 @@ impl Scanning<JuliaMlirVM> for JuliaMlirScanning {
         // Single-threaded: enumerate all roots from the shadow stack.
         // The root stack stores raw pointers to heap objects.
         unsafe {
-            let top = GC_ROOT_STACK_TOP.load(Ordering::SeqCst);
+            let top_addr = GC_ROOT_STACK_TOP_ADDR.load(Ordering::SeqCst);
             let base = GC_ROOT_STACK_BASE.load(Ordering::SeqCst);
-            if top == 0 || base == 0 || top <= base {
+            if top_addr == 0 || base == 0 {
+                return;
+            }
+            let top = *(top_addr as *const usize);
+            if top <= base {
                 return;
             }
 
@@ -400,6 +542,18 @@ impl Scanning<JuliaMlirVM> for JuliaMlirScanning {
     }
 
     fn prepare_for_roots_re_scanning() {}
+
+    fn is_obj_array(o: ObjectReference) -> bool {
+        matches!(classify_object(o), ObjectKind::ObjArray(_))
+    }
+
+    fn is_val_array(o: ObjectReference) -> bool {
+        matches!(classify_object(o), ObjectKind::ValArray)
+    }
+
+    fn get_obj_kind(o: ObjectReference) -> ObjectKind {
+        classify_object(o)
+    }
 
     fn process_weak_refs(
         _worker: &mut mmtk::scheduler::GCWorker<JuliaMlirVM>,
@@ -441,6 +595,15 @@ impl Collection<JuliaMlirVM> for JuliaMlirCollection {
         // Signal the mutator to stop at the next safepoint.
         GC_REQUESTED.store(true, Ordering::SeqCst);
 
+        // Arm the page-protection safepoint: mprotect to PROT_NONE so the
+        // next volatile load from the safepoint page faults and triggers
+        // the SIGSEGV handler which calls block_for_gc.
+        if SAFEPOINT_PAGE.load(Ordering::Relaxed) != 0 {
+            unsafe {
+                jlmlir_safepoint_arm();
+            }
+        }
+
         // Wait for the mutator to reach a safepoint and stop.
         while !MUTATOR_STOPPED.load(Ordering::SeqCst) {
             std::hint::spin_loop();
@@ -459,6 +622,15 @@ impl Collection<JuliaMlirVM> for JuliaMlirCollection {
     fn resume_mutators(_tls: VMWorkerThread) {
         GC_REQUESTED.store(false, Ordering::SeqCst);
         MUTATOR_STOPPED.store(false, Ordering::SeqCst);
+
+        // Disarm the safepoint page: mprotect back to PROT_READ so future
+        // volatile loads succeed without faulting.
+        if SAFEPOINT_PAGE.load(Ordering::Relaxed) != 0 {
+            unsafe {
+                jlmlir_safepoint_disarm();
+            }
+        }
+
         GC_DONE.store(true, Ordering::SeqCst);
     }
 
@@ -610,7 +782,11 @@ fn get_mmtk() -> &'static MMTK<JuliaMlirVM> {
 // ============================================================================
 
 static GC_ROOT_STACK_BASE: AtomicUsize = AtomicUsize::new(0);
-static GC_ROOT_STACK_TOP: AtomicUsize = AtomicUsize::new(0);
+/// Address of the @_jlmlir_gc_root_top global in the MLIR binary.
+/// Dereference to read the current root stack top value.
+/// This avoids per-root FFI calls — the MLIR code writes root_top
+/// directly to the global, and we read it through this indirection.
+static GC_ROOT_STACK_TOP_ADDR: AtomicUsize = AtomicUsize::new(0);
 
 // Global roots table (type descriptors, interned symbols, etc.)
 static GLOBAL_ROOTS_BASE: AtomicUsize = AtomicUsize::new(0);
@@ -618,6 +794,15 @@ static GLOBAL_ROOTS_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 // GC statistics
 static GC_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+// Safepoint page address — set by jlmlir_gc_init, read by MLIR-compiled code
+static SAFEPOINT_PAGE: AtomicUsize = AtomicUsize::new(0);
+
+extern "C" {
+    fn jlmlir_safepoint_init(gc_callback: extern "C" fn()) -> *mut u8;
+    fn jlmlir_safepoint_arm();
+    fn jlmlir_safepoint_disarm();
+}
 
 // ============================================================================
 // C API — called by the MLIR-compiled freestanding binary
@@ -680,6 +865,29 @@ pub unsafe extern "C" fn jlmlir_gc_init(heap_size: usize) {
         get_mmtk(),
         VMThread(OpaquePointer::from_address(Address::from_usize(1))),
     );
+
+    // Initialize page-protection safepoint.
+    let page = jlmlir_safepoint_init(safepoint_gc_block);
+    SAFEPOINT_PAGE.store(page as usize, Ordering::SeqCst);
+}
+
+/// Callback invoked by the SIGSEGV handler when the mutator faults on the
+/// safepoint page. Flushes barrier buffers, blocks for GC, then returns
+/// (the handler disarms the page so the faulting instruction re-executes).
+extern "C" fn safepoint_gc_block() {
+    // Flush barrier buffers before blocking.
+    unsafe {
+        let mutator_ptr = THE_MUTATOR.load(Ordering::SeqCst);
+        if mutator_ptr != 0 {
+            let mutator = &mut *(mutator_ptr as *mut Mutator<JuliaMlirVM>);
+            mutator.barrier.flush();
+        }
+    }
+    // Block for GC (sets MUTATOR_STOPPED, waits for GC_DONE).
+    let tls = VMMutatorThread(VMThread(OpaquePointer::from_address(unsafe {
+        Address::from_usize(1)
+    })));
+    <JuliaMlirCollection as Collection<JuliaMlirVM>>::block_for_gc(tls);
 }
 
 /// Bind a mutator to the current thread and return a pointer to it.
@@ -784,6 +992,93 @@ pub unsafe extern "C" fn jlmlir_setfield_raw(obj: *mut u8, offset: usize, value:
     *field_addr = value;
 }
 
+// ============================================================================
+// Write barrier API for LXR (N4c)
+//
+// LXR uses a field-logging barrier. Before writing a new pointer value into
+// a managed object's field, the mutator must call the barrier so that LXR can:
+//   1. Read the old value from the slot (for RC decrement)
+//   2. Record the new slot (for RC increment)
+//   3. SATB-log the old value if concurrent marking is active
+//
+// The barrier checks a per-field "unlog bit" in side metadata.  If the field
+// is already logged (common case), the check is a single byte load → no-op.
+// Otherwise the slow path is taken.
+//
+// API contract:
+//   jlmlir_write_barrier_pre(mutator, src_obj, slot_addr, new_target)
+//     — Call BEFORE writing the pointer.
+//     — src_obj: the object being mutated (ObjectReference = body start)
+//     — slot_addr: address of the field being written
+//     — new_target: the new pointer value being stored (0 if non-ref)
+//
+//   jlmlir_setfield_barrier(mutator, src_obj, offset, new_value)
+//     — Subsuming barrier + store in one call (convenience wrapper).
+//       Calls the pre-barrier, then performs the store.
+// ============================================================================
+
+/// Write barrier pre-call for LXR.  Call BEFORE writing a pointer into a
+/// managed object field.  Under non-LXR plans this is a no-op.
+///
+/// # Arguments
+/// * `mutator`    - Mutator pointer from `jlmlir_bind_mutator`.
+/// * `src`        - The object being mutated (pointer to body start).
+/// * `slot_addr`  - Address of the field about to be written.
+/// * `new_target` - The new pointer value to be stored (body pointer, or 0).
+#[no_mangle]
+pub unsafe extern "C" fn jlmlir_write_barrier_pre(
+    mutator: *mut Mutator<JuliaMlirVM>,
+    src: *const u8,
+    slot_addr: *mut u8,
+    new_target: *const u8,
+) {
+    let src_addr = Address::from_usize(src as usize);
+    if let Some(src_obj) = ObjectReference::from_raw_address(src_addr) {
+        let slot = SimpleSlot::from_address(Address::from_usize(slot_addr as usize));
+        let target = if new_target.is_null() {
+            None
+        } else {
+            ObjectReference::from_raw_address(Address::from_usize(new_target as usize))
+        };
+        memory_manager::object_reference_write_pre(&mut *mutator, src_obj, slot, target);
+    }
+}
+
+/// Subsuming write barrier + store.  Sets a pointer field on a managed object
+/// with proper LXR write barrier semantics.
+///
+/// Equivalent to:
+///   jlmlir_write_barrier_pre(mutator, obj, &obj[offset], value)
+///   obj[offset] = value
+///
+/// # Arguments
+/// * `mutator` - Mutator pointer from `jlmlir_bind_mutator`.
+/// * `obj`     - The object being mutated (pointer to body start).
+/// * `offset`  - Byte offset of the field within the body.
+/// * `value`   - The new pointer-sized value to store.
+#[no_mangle]
+pub unsafe extern "C" fn jlmlir_setfield_barrier(
+    mutator: *mut Mutator<JuliaMlirVM>,
+    obj: *mut u8,
+    offset: usize,
+    value: usize,
+) {
+    let slot_addr = (obj as usize + offset) as *mut u8;
+    let new_target = value as *const u8;
+    jlmlir_write_barrier_pre(mutator, obj, slot_addr, new_target);
+    // Perform the actual store
+    let field_addr = slot_addr as *mut usize;
+    *field_addr = value;
+}
+
+/// Flush the mutator's barrier buffers.  Should be called at safepoints
+/// and before GC to ensure all pending RC increments/decrements and SATB
+/// entries are published to the GC workers.
+#[no_mangle]
+pub unsafe extern "C" fn jlmlir_barrier_flush(mutator: *mut Mutator<JuliaMlirVM>) {
+    (*mutator).barrier.flush();
+}
+
 /// Get total used bytes.
 #[no_mangle]
 pub extern "C" fn jlmlir_used_bytes() -> usize {
@@ -802,20 +1097,15 @@ pub extern "C" fn jlmlir_total_bytes() -> usize {
 
 /// Set the GC root stack pointers. Called once at startup by the MLIR binary.
 /// The root stack is a flat array of pointer-sized slots, growing upward.
-/// `base` = start of the array, `top` = pointer to current top variable.
+/// `base` = start of the root stack array.
+/// `top_addr` = address of the @_jlmlir_gc_root_top global variable.
+///              The GC reads `*(top_addr)` during root scanning to get the
+///              current top value. This eliminates per-root FFI calls —
+///              the MLIR code writes root_top directly to the global.
 #[no_mangle]
-pub unsafe extern "C" fn jlmlir_gc_set_root_stack(base: usize, top_ptr: usize) {
+pub unsafe extern "C" fn jlmlir_gc_set_root_stack(base: usize, top_addr: usize) {
     GC_ROOT_STACK_BASE.store(base, Ordering::SeqCst);
-    // top_ptr is the address of the variable holding the current top.
-    // We need to read through this indirection during root scanning.
-    GC_ROOT_STACK_TOP.store(top_ptr, Ordering::SeqCst);
-}
-
-/// Update the root stack top. Called by the MLIR code at each safepoint
-/// to publish the current stack height to the GC.
-#[no_mangle]
-pub unsafe extern "C" fn jlmlir_gc_update_root_top(top: usize) {
-    GC_ROOT_STACK_TOP.store(top, Ordering::SeqCst);
+    GC_ROOT_STACK_TOP_ADDR.store(top_addr, Ordering::SeqCst);
 }
 
 /// Register a global root slot. The GC will scan this slot during collection.
@@ -839,13 +1129,71 @@ pub unsafe extern "C" fn jlmlir_gc_init_global_roots(table_addr: usize, _capacit
     GLOBAL_ROOTS_COUNT.store(0, Ordering::SeqCst);
 }
 
+/// Return the address of the safepoint page for volatile loads.
+/// The MLIR lowering stores this in a global and emits `volatile load i32`
+/// from it at each safepoint. When GC is requested, the page is mprotected
+/// to PROT_NONE, causing a SIGSEGV that the libc shim handler catches.
+#[no_mangle]
+pub extern "C" fn jlmlir_safepoint_page() -> usize {
+    SAFEPOINT_PAGE.load(Ordering::Relaxed)
+}
+
+/// Return the absolute base address of the LXR field-unlog-bit side metadata.
+///
+/// The MLIR lowering inlines the write barrier fast path as:
+///   meta_byte = load_byte(base + (slot_addr >> 6))
+///   bit_pos   = (slot_addr >> 3) & 7
+///   if (meta_byte & (1 << bit_pos)) == 0: skip   // already logged
+///   else: call slow path
+///
+/// The base address is computed from the FIELD_UNLOG_SIDE_METADATA_SPEC's
+/// absolute offset in the contiguous global side metadata space.
+///
+/// Returns 0 when the LXR plan is not active (no field barrier needed).
+#[no_mangle]
+pub extern "C" fn jlmlir_field_unlog_bit_base_address() -> usize {
+    let spec = FIELD_UNLOG_SIDE_METADATA_SPEC.as_spec();
+    match spec {
+        mmtk::util::metadata::MetadataSpec::OnSide(side_spec) => {
+            side_spec.get_absolute_offset().as_usize()
+        }
+        _ => 0,
+    }
+}
+
+/// Return the log_bytes_in_region for the field unlog bit spec.
+/// This is the right-shift applied to the data address before indexing
+/// into the metadata table. For the field-unlog-bit, this is
+/// LOG_BYTES_IN_ADDRESS (= 3 on 64-bit), meaning 1 bit per pointer-sized word.
+///
+/// The metadata byte address is: base + (data_addr >> (log_bytes_in_region + 3))
+/// The bit position within that byte: (data_addr >> log_bytes_in_region) & 7
+#[no_mangle]
+pub extern "C" fn jlmlir_field_unlog_bit_log_region() -> usize {
+    let spec = FIELD_UNLOG_SIDE_METADATA_SPEC.as_spec();
+    match spec {
+        mmtk::util::metadata::MetadataSpec::OnSide(side_spec) => side_spec.log_bytes_in_region,
+        _ => 0,
+    }
+}
+
 /// GC safepoint check. Called by the MLIR code at loop back-edges and
 /// function prologues. If GC is requested, blocks until collection completes.
 ///
 /// Returns 1 if GC occurred, 0 otherwise.
+///
+/// Legacy function-call safepoint — kept for backward compatibility.
+/// New code uses the page-protection safepoint via volatile load.
 #[no_mangle]
 pub unsafe extern "C" fn jlmlir_gc_safepoint() -> u32 {
     if GC_REQUESTED.load(Ordering::Relaxed) {
+        // Flush barrier buffers before stopping — LXR needs pending
+        // RC inc/dec/SATB entries published before collection starts.
+        let mutator_ptr = THE_MUTATOR.load(Ordering::SeqCst);
+        if mutator_ptr != 0 {
+            let mutator = &mut *(mutator_ptr as *mut Mutator<JuliaMlirVM>);
+            mutator.barrier.flush();
+        }
         // We're at a safepoint — block for GC.
         let tls = VMMutatorThread(VMThread(OpaquePointer::from_address(Address::from_usize(
             1,

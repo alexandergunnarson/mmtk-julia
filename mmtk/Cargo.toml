@@ -18,6 +18,7 @@ bindgen = { version = "*", optional = true }
 
 [profile.release]
 lto = true
+panic = "abort"
 
 [dependencies]
 libc = "0.2"
@@ -50,7 +51,7 @@ julia_mlir = ["julia_mlir_immix"]
 julia_mlir_nogc = []
 julia_mlir_immix = ["mmtk/immix_non_moving", "mmtk/single_worker"]
 julia_mlir_immix_moving = ["mmtk/single_worker"]
-julia_mlir_lxr = []
+julia_mlir_lxr = ["mmtk/single_worker", "mmtk/lxr_no_evac"]
 
 # Plans (hosted)
 nogc = []
